@@ -1,0 +1,6 @@
+#files to ignore
+
+*.csv
+*.xlsx
+/Data
+/Models
