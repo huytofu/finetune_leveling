@@ -1,0 +1,3 @@
+# explore_llm
+
+THIS IS A PROJECT TO PLAY WITH LLMs
