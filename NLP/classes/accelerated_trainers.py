@@ -172,6 +172,8 @@ class AcceleratedNLPTrainer():
         elif self.task_type == "masked_language_modeling":
             # TO ADD LATER
             pass
+        elif self.task_type in ["summarization", "translation", "text_generation"]:
+            pass
         elif self.task_type == "question_answering":
             batch_start_logits = self.accelerator.gather(outputs.start_logits).cpu().numpy()
             batch_end_logits = self.accelerator.gather(outputs.end_logits).cpu().numpy()
@@ -187,10 +189,11 @@ class AcceleratedNLPTrainer():
         losses.append(self.accelerator.gather(loss.repeat(batch_size)))
 
         #Gather the metrics
-        if self.task_type in ["token_classification"]:
+        if self.task_type == "token_classification":
             if batch["labels"] is not None:
                 self.handle_predictions_and_metric(outputs, batch, metric)
         elif self.task_type == "masked_language_modeling":
+            # TO ADD LATER
             pass
 
     def train(self):
@@ -389,24 +392,18 @@ class AcceleratedNLPSeq2SeqTrainer():
         return result
     
     def handle_predictions_and_metric(self, outputs, batch, metric):
-        if self.task_type == "question_answering":
-            batch_start_logits = self.accelerator.gather(outputs.start_logits).cpu().numpy()
-            batch_end_logits = self.accelerator.gather(outputs.end_logits).cpu().numpy()
-            self.start_logits.append(batch_start_logits)
-            self.end_logits.append(batch_end_logits)
-        else:
-            predictions = self.accelerator.unwrap_model(self.model).generate(
-                batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                max_length=self.specs["max_length"],
-            )
-            labels = batch["labels"]
-            predictions = self.accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
-            labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-            predictions = self.accelerator.gather(predictions)
-            labels = self.accelerator.gather(labels)
-            true_predictions, true_labels = self.postprocess(predictions, labels)
-            metric.add_batch(predictions=true_predictions, references=true_labels)
+        predictions = self.accelerator.unwrap_model(self.model).generate(
+            batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            max_length=self.specs["max_length"],
+        )
+        labels = batch["labels"]
+        predictions = self.accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
+        labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+        predictions = self.accelerator.gather(predictions)
+        labels = self.accelerator.gather(labels)
+        true_predictions, true_labels = self.postprocess(predictions, labels)
+        metric.add_batch(predictions=true_predictions, references=true_labels)
 
     def handle_outputs(self, outputs, batch, batch_size, losses, metric):
         loss = outputs.loss

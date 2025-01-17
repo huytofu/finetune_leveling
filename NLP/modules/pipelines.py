@@ -15,19 +15,30 @@ from configs import DEFAULT_SPECS
 
 class InferencePipeLine():
     def __init__(self, task_type, checkpoint):
-        if task_type == "translation":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+        if task_type == "token_classification":
+            self.loaded_pipeline = pipeline(task_type, model=checkpoint, aggregation_strategy="simple")     
         elif task_type == "masked_language_modeling":
             self.loaded_pipeline = pipeline(task_type, model=checkpoint)
-        elif task_type == "token_classification":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint, aggregation_strategy="simple")
+        elif task_type == "translation":
+            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
         elif task_type == "summarization":
             self.loaded_pipeline = pipeline(task_type, model=checkpoint)
         elif task_type == "question_answering":
             self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+        elif task_type == "text_generation":
+            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
         else: pass
+        self.task_type = task_type
     
     def run(self, input_text):
+        if self.task_type == "translation":
+            return self.loaded_pipeline(input_text, return_text=True)[0]["translation_text"]
+        elif self.task_type == "summarization":
+            return self.loaded_pipeline(input_text, return_text=True)[0]["summary_text"]
+        elif self.task_type == "question_answering":
+            return self.loaded_pipeline(input_text, return_text=True)[0]["answer"]
+        elif self.task_type == "text_generation":
+            return self.loaded_pipeline(input_text, return_text=True)[0]["generated_text"]
         return self.loaded_pipeline(input_text)
 
 class FineTunePipeLine():
@@ -101,6 +112,11 @@ class FineTunePipeLine():
                     return result
                 else:
                     return self.metric.compute(predictions=true_predictions, references=true_labels)
+        elif task_type == "text_generation":
+            def compute_metrics(eval_pred):
+                predictions, labels = eval_pred
+                true_labels, true_predictions = self.postprocess(predictions, labels)
+                return self.metric.compute(predictions=true_predictions, references=true_labels)
         return compute_metrics
 
     def compute_qna_metrics(self, start_logits, end_logits, eval_dataset, raw_eval_dataset, chosen_metric, max_answer_length):
@@ -183,7 +199,7 @@ class FineTunePipeLine():
         else:
             if self.task_type != "question_answering":
                 compute_metrics = self.get_compute_metrics(self.task_type, self.chosen_metric)
-                if self.task_type in ["translation", "summarization"]:
+                if self.task_type in ["translation", "summarization", "text_generation"]:
                     trainer = NLPSeq2SeqTrainer(
                         self.args_dir, self.model, self.tokenizer, 
                         self.data_collator, self.dataset['train'], self.dataset['eval'], 
