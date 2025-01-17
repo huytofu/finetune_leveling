@@ -3,6 +3,13 @@ import evaluate
 import nltk
 import collections
 import json
+import os
+import sys
+currdir = os.path.dirname(os.path.abspath(__file__))
+parentdir = os.path.dirname(currdir)
+sys.path.append(currdir)
+sys.path.append(parentdir)
+
 
 from transformers import pipeline
 from model_modules import ModelModules
@@ -11,34 +18,35 @@ from pretrain_modules import PretrainModules
 from dataset_modules import DatasetModules
 from classes.accelerated_trainers import AcceleratedNLPTrainer, AcceleratedNLPSeq2SeqTrainer
 from classes.trainers import NLPTrainer, NLPSeq2SeqTrainer
-from configs import DEFAULT_SPECS
+from configs.default_config import DEFAULT_SPECS
 
 class InferencePipeLine():
     def __init__(self, task_type, checkpoint):
+        self.task_type = task_type.replace("_","-")
+        self.specs = {**DEFAULT_SPECS}
         if task_type == "token_classification":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint, aggregation_strategy="simple")     
+            self.loaded_pipeline = pipeline(self.task_type, model=checkpoint, aggregation_strategy="simple")     
         elif task_type == "masked_language_modeling":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+            self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
         elif task_type == "translation":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+            self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
         elif task_type == "summarization":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+            self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
         elif task_type == "question_answering":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+            self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
         elif task_type == "text_generation":
-            self.loaded_pipeline = pipeline(task_type, model=checkpoint)
+            self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
         else: pass
-        self.task_type = task_type
     
     def run(self, input_text):
         if self.task_type == "translation":
-            return self.loaded_pipeline(input_text, return_text=True)[0]["translation_text"]
+            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["translation_text"]
         elif self.task_type == "summarization":
-            return self.loaded_pipeline(input_text, return_text=True)[0]["summary_text"]
-        elif self.task_type == "question_answering":
-            return self.loaded_pipeline(input_text, return_text=True)[0]["answer"]
-        elif self.task_type == "text_generation":
-            return self.loaded_pipeline(input_text, return_text=True)[0]["generated_text"]
+            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["summary_text"]
+        elif self.task_type == "question-answering":
+            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["answer"]
+        elif self.task_type == "text-generation":
+            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["generated_text"]
         return self.loaded_pipeline(input_text)
 
 class FineTunePipeLine():

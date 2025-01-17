@@ -1,11 +1,13 @@
+import os
 import sys
-sys.path.append('../configs')
+parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parentdir)
 
 import json
 from transformers import DataCollatorForLanguageModeling, DataCollatorForTokenClassification, DataCollatorForSeq2Seq
-from torch.optim import AdamW
-from configs import DEFAULT_SPECS
 from transformers import default_data_collator
+from torch.optim import AdamW
+from configs.default_config import DEFAULT_SPECS
 
 class PretrainModules():
     def __init__(self, args_dir, tokenizer, model):
@@ -40,6 +42,8 @@ class PretrainModules():
         elif task_type == "translation":
             data_collator = DataCollatorForSeq2Seq(tokenizer=self.tokenizer, model=self.model)
         elif task_type == "summarization":
+            data_collator = DataCollatorForSeq2Seq(tokenizer=self.tokenizer, model=self.model)
+        elif task_type == "text_generation":
             data_collator = DataCollatorForSeq2Seq(tokenizer=self.tokenizer, model=self.model)
         elif task_type == "question_answering":
             data_collator = default_data_collator

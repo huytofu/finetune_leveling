@@ -27,6 +27,11 @@ class ModelModules():
                 model = None
             else:
                 model = AutoModelForSeq2SeqLM.from_pretrained(self.checkpoint)
+        elif task_type == "text_generation":
+            if self.use_bert:
+                model = None
+            else:
+                model = AutoModelForSeq2SeqLM.from_pretrained(self.checkpoint)
         elif task_type == "question_answering":
             if self.use_bert:
                 model = None

@@ -1,10 +1,12 @@
+import os
 import sys
-sys.path.append('../configs')
+parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parentdir)
 
 import json
 import evaluate
 from transformers import TrainingArguments, Trainer, Seq2SeqTrainer
-from configs import DEFAULT_SPECS
+from configs.default_config import DEFAULT_SPECS
 
 class NLPTrainer(Trainer):
     def __init__(self, args_dir, model, tokenizer, 

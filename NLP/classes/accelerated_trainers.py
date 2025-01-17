@@ -1,5 +1,7 @@
+import os
 import sys
-sys.path.append('../configs')
+parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parentdir)
 
 import torch
 import nltk
@@ -12,7 +14,7 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
 from tqdm.auto import tqdm
-from configs import DEFAULT_SPECS
+from configs.default_config import DEFAULT_SPECS
 
 class AcceleratedNLPTrainer():
     def __init__(self, args_dir, model, tokenizer, 
