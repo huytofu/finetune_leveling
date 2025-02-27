@@ -43,6 +43,7 @@ class GradioBase:
         self.title = None
         self.examples = None
         self.descriptions = None
+        self.can_demo = False
 
     def prepare_main_function(self, main_func):
         self.main_func = main_func
@@ -58,15 +59,30 @@ class GradioBase:
         self.title = title
         self.descriptions = descriptions
 
-    def prepare_demo(self):
-        self.demo = gr.Interface(
-            fn=self.main_func, examples=self.examples,
-            title=self.title, description=self.descriptions,
-            inputs=self.inputs, outputs=self.outputs
-        )
+    def prepare_demo(self, use_func_or_pipeline, checkpoint=None):
+        if use_func_or_pipeline:
+            self.demo = gr.Interface(
+                fn=self.main_func, examples=self.examples,
+                title=self.title, description=self.descriptions,
+                inputs=self.inputs, outputs=self.outputs
+            )
+            self.can_demo = True
+        else:
+            if checkpoint is not None:
+                self.demo = gr.load(
+                    checkpoint, src="models",
+                    inputs=self.inputs, outputs=self.outputs,
+                    title=self.title, description=self.descriptions,
+                )
+                self.can_demo = True
+            else:
+                self.can_demo = False
     
     def launch(self):
-        self.demo.launch()
+        if self.can_demo:
+            self.demo.launch()
+        else:
+            print("Cannot Demo")
 
 
 # test = GradioBase([
@@ -81,7 +97,7 @@ class GradioBase:
 #     ["C", 4, 1],
 #     ["D", 5, 2]
 # ])
-# test.prepare_demo()
+# test.prepare_demo(True)
 # test.launch()
 
 # test2 = GradioBase(
@@ -90,9 +106,19 @@ class GradioBase:
 # test2.prepare_pipeline(
 #     InferencePipeLine("text_generation", "google/flan-t5-small")
 # )
-# test2.prepare_demo()
+# test2.prepare_demo(True)
 # test2.launch()
 
-pl = InferencePipeLine("text_generation", "mistralai/Mistral-7B-v0.1")
-a = pl.run("Make poem that starts with: I am handsome")
-print(a)
+test2 = GradioBase(
+    "text", "text"
+)
+test2.prepare_title_n_descriptions(
+    "Hello there!",
+    "Please chat with me"
+)
+test2.prepare_demo(False,
+    # "google/flan-t5-small"
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    # "deepseek-ai/DeepSeek-V3"
+)
+test2.launch()
