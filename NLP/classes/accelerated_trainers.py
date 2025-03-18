@@ -10,6 +10,7 @@ import evaluate
 import collections
 import numpy as np
 import logging
+import configargparse
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -19,6 +20,30 @@ from configs.default_config import DEFAULT_SPECS
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+
+# Initialize the parser
+p = configargparse.ArgParser(default_config_files=["config.yaml"])
+
+# Add configuration arguments
+p.add('--output_dir', type=str, help='Output directory for model checkpoints', default='nameless_model')
+p.add('--evaluation_strategy', type=str, help='Evaluation strategy', default='epoch')
+p.add('--scheduler_strategy', type=str, help='Scheduler strategy', default='linear')
+p.add('--num_train_epochs', type=int, help='Number of training epochs', default=3)
+p.add('--learning_rate', type=float, help='Learning rate', default=2e-5)
+p.add('--weight_decay', type=float, help='Weight decay', default=0.01)
+p.add('--push_to_hub', type=bool, help='Whether to push to hub', default=True)
+p.add('--per_device_train_batch_size', type=int, help='Training batch size per device', default=8)
+p.add('--per_device_eval_batch_size', type=int, help='Evaluation batch size per device', default=8)
+p.add('--mlm_probability', type=float, help='Masked language modeling probability', default=0.2)
+p.add('--max_length', type=int, help='Maximum sequence length', default=256)
+p.add('--chunk_size', type=int, help='Chunk size for processing', default=128)
+p.add('--stride', type=int, help='Stride for processing', default=64)
+p.add('--fp16', type=bool, help='Use FP16 precision', default=True)
+p.add('--gradient_accumulation_steps', type=int, help='Gradient accumulation steps', default=1)
+p.add('--max_grad_norm', type=float, help='Maximum gradient norm', default=1.0)
+
+# Parse arguments
+args = p.parse_args()
 
 class AcceleratedNLPTrainer():
     """
@@ -61,8 +86,8 @@ class AcceleratedNLPTrainer():
             self.datasets = {"train": train_dataset, "eval": eval_dataset}
             self.raw_dataset = raw_dataset
             self.tokenizer = tokenizer
-            specs = json.load(open(args_dir, 'r'))
-            self.specs = {**DEFAULT_SPECS, **specs}
+            # Use parsed arguments
+            self.specs = vars(args)
             
             self.prepare_with_accelerator(train_dataset, eval_dataset)
             self.prepare_scheduler()
