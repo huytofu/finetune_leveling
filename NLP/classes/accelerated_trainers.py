@@ -125,6 +125,16 @@ class AcceleratedNLPTrainer():
             raise
 
     def prepare_data_loader(self, slice_type, dataset):
+        """
+        Prepare the data loader with dynamic batching and efficient data loading.
+        
+        Args:
+            slice_type (str): The type of dataset slice ('train' or 'eval').
+            dataset: The dataset to load.
+        
+        Returns:
+            DataLoader: The prepared data loader.
+        """
         if slice_type == "train":
             shuffle = True
             batch_size = self.specs['per_device_train_batch_size']
@@ -132,12 +142,15 @@ class AcceleratedNLPTrainer():
             shuffle = False
             batch_size = self.specs['per_device_eval_batch_size']
         
+        # Use dynamic padding to minimize padding token computation
         dataset.set_format('torch')
         self.dataloader = DataLoader(
             dataset, 
             shuffle=shuffle, 
             collate_fn=self.data_collator, 
-            batch_size=batch_size
+            batch_size=batch_size,
+            pin_memory=True,  # Pin memory for faster data transfer to GPU
+            num_workers=4  # Use multiple workers for data loading
         )
         
         return self.dataloader
