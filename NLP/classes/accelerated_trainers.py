@@ -288,47 +288,86 @@ class AcceleratedNLPTrainer():
             pass
 
     def train(self):
+        """
+        Train the model with mixed precision and gradient accumulation.
+        """
         for epoch in range(self.num_train_epochs):
-            print("Currently in epoch", epoch)
+            logging.info(f"Starting epoch {epoch}")
 
             self.model.train()
-            #Training with forward & backward pass
-            for batch in self.train_dataloader:
-                outputs = self.model(**batch)
-                loss = outputs.loss
-                self.accelerator.backward(loss)
-
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-                self.progress_bar.update(1)
+            for step, batch in enumerate(self.train_dataloader):
+                self._train_step(batch, step)
             
             self.model.eval()
-            if self.task_type == "question_answering":
-                self.start_logits = []
-                self.end_logits = []
-
             for step, batch in enumerate(self.eval_dataloader):
-                with torch.no_grad():
-                    outputs = self.model(**batch)
-                
-                self.handle_outputs(outputs, batch, self.specs['per_device_eval_batch_size'], 
-                                    self.losses, self.metric)
-                print("Finished evaluating step", step)
+                self._eval_step(batch, step)
 
-            losses = torch.cat(self.losses)
-            losses = losses[: len(self.datasets['eval'])]
-            print("Losses:", losses)
-
-            if self.task_type == "question_answering":
-                self.start_logits = np.concatenate(self.start_logits)[: len(self.eval_dataset)]
-                self.end_logits = np.concatenate(self.end_logits)[: len(self.eval_dataset)]
-                self.compute_qna_metrics(self.start_logits, self.end_logits, self.eval_dataset, self.raw_dataset['eval'])
-            else:
-                self.metric.compute()
-            
+            self._compute_metrics()
             self.save_and_upload(epoch)
-            
+            logging.info(f"Completed epoch {epoch}")
+
+    def _train_step(self, batch, step):
+        """
+        Perform a single training step.
+        
+        Args:
+            batch: The batch of data for the current step.
+            step: The current step number.
+        """
+        with self.accelerator.autocast():  # Use mixed precision
+            outputs = self.model(**batch)
+            loss = outputs.loss / self.specs['gradient_accumulation_steps']
+        self.accelerator.backward(loss)
+
+        if (step + 1) % self.specs['gradient_accumulation_steps'] == 0:
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            self.progress_bar.update(1)
+
+    def _eval_step(self, batch, step):
+        """
+        Perform a single evaluation step.
+        
+        Args:
+            batch: The batch of data for the current step.
+            step: The current step number.
+        """
+        with torch.no_grad():
+            outputs = self.model(**batch)
+            self._handle_outputs(outputs, batch)
+        logging.info(f"Finished evaluating step {step}")
+
+    def _handle_outputs(self, outputs, batch):
+        """
+        Handle the outputs from the model.
+        
+        Args:
+            outputs: The outputs from the model.
+            batch: The batch of data associated with the outputs.
+        """
+        # Example logic for handling outputs
+        if self.task_type == "question_answering":
+            self.start_logits.append(outputs.start_logits.cpu().numpy())
+            self.end_logits.append(outputs.end_logits.cpu().numpy())
+        else:
+            self.losses.append(outputs.loss.cpu().numpy())
+
+    def _compute_metrics(self):
+        """
+        Compute and log metrics after evaluation.
+        """
+        losses = torch.cat(self.losses)
+        losses = losses[: len(self.datasets['eval'])]
+        logging.info(f"Losses: {losses}")
+
+        if self.task_type == "question_answering":
+            self.start_logits = np.concatenate(self.start_logits)
+            self.end_logits = np.concatenate(self.end_logits)
+            self.compute_qna_metrics(self.start_logits, self.end_logits, self.eval_dataset, self.raw_dataset['eval'])
+        else:
+            self.metric.compute()
+
     def print_args(self):
         print(self.specs)
 
