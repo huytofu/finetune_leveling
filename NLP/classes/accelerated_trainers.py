@@ -9,6 +9,7 @@ import json
 import evaluate
 import collections
 import numpy as np
+import logging
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -16,37 +17,87 @@ from transformers import get_scheduler
 from tqdm.auto import tqdm
 from configs.default_config import DEFAULT_SPECS
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
 class AcceleratedNLPTrainer():
+    """
+    A trainer class for NLP models using the Accelerate library.
+    
+    Attributes:
+        model: The model to be trained.
+        optimizer: The optimizer for training.
+        data_collator: The data collator for batching.
+        datasets: A dictionary containing training and evaluation datasets.
+        raw_dataset: The raw dataset for processing.
+        tokenizer: The tokenizer for text processing.
+        specs: Configuration specifications for training.
+        task_type: The type of task (e.g., classification, generation).
+        losses: A list to store training losses.
+        metric: The evaluation metric.
+    """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
                 task_type, optimizer, chosen_metric):
-        self.model = model
-        self.optimizer = optimizer
-        self.data_collator = data_collator
-        self.datasets = {"train": train_dataset, "eval": eval_dataset}
-        self.raw_dataset = raw_dataset
-        self.tokenizer = tokenizer
-        specs = json.load(open(args_dir, 'r'))
-        self.specs = {**DEFAULT_SPECS, **specs}
+        """
+        Initialize the AcceleratedNLPTrainer.
         
-        self.prepare_with_accelerator(train_dataset, eval_dataset)
-        self.prepare_scheduler()
+        Args:
+            args_dir (str): Directory containing configuration arguments.
+            model: The model to be trained.
+            tokenizer: The tokenizer for text processing.
+            data_collator: The data collator for batching.
+            train_dataset: The training dataset.
+            eval_dataset: The evaluation dataset.
+            raw_dataset: The raw dataset for processing.
+            task_type (str): The type of task (e.g., classification, generation).
+            optimizer: The optimizer for training.
+            chosen_metric (str): The metric for evaluation.
+        """
+        try:
+            self.model = model
+            self.optimizer = optimizer
+            self.data_collator = data_collator
+            self.datasets = {"train": train_dataset, "eval": eval_dataset}
+            self.raw_dataset = raw_dataset
+            self.tokenizer = tokenizer
+            specs = json.load(open(args_dir, 'r'))
+            self.specs = {**DEFAULT_SPECS, **specs}
+            
+            self.prepare_with_accelerator(train_dataset, eval_dataset)
+            self.prepare_scheduler()
 
-        self.progress_bar = tqdm(range(self.num_training_steps | 1))
-        self.task_type = task_type
-        self.losses = []
-        self.metric = evaluate.load(chosen_metric)
+            self.progress_bar = tqdm(range(self.num_training_steps | 1))
+            self.task_type = task_type
+            self.losses = []
+            self.metric = evaluate.load(chosen_metric)
+            logging.info("AcceleratedNLPTrainer initialized successfully.")
+        except Exception as e:
+            logging.error(f"Error initializing AcceleratedNLPTrainer: {e}")
+            raise
 
     def prepare_with_accelerator(self, train_dataset, eval_dataset):
-        #prepare data loader
-        self.train_dataloader = self.prepare_data_loader("train", train_dataset)
-        self.eval_dataloader = self.prepare_data_loader("eval", eval_dataset)
+        """
+        Prepare the model and datasets with the Accelerator.
+        
+        Args:
+            train_dataset: The training dataset.
+            eval_dataset: The evaluation dataset.
+        """
+        try:
+            #prepare data loader
+            self.train_dataloader = self.prepare_data_loader("train", train_dataset)
+            self.eval_dataloader = self.prepare_data_loader("eval", eval_dataset)
 
-        self.accelerator = Accelerator(fp16=True)
-        #Prepare the model, optimizer, train_dataloader, and eval_dataloader based on available devices/hardware
-        self.model, self.optimizer, self.train_dataloader, self.eval_dataloader = self.accelerator.prepare(
-            self.model, self.optimizer, self.train_dataloader, self.eval_dataloader
-        )
+            self.accelerator = Accelerator(fp16=True)
+            #Prepare the model, optimizer, train_dataloader, and eval_dataloader based on available devices/hardware
+            self.model, self.optimizer, self.train_dataloader, self.eval_dataloader = self.accelerator.prepare(
+                self.model, self.optimizer, self.train_dataloader, self.eval_dataloader
+            )
+            logging.info("Model and datasets prepared with Accelerator.")
+        except Exception as e:
+            logging.error(f"Error preparing with Accelerator: {e}")
+            raise
 
     def prepare_data_loader(self, slice_type, dataset):
         if slice_type == "train":
