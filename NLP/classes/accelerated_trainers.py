@@ -374,23 +374,9 @@ class AcceleratedNLPTrainer():
         """
         with torch.no_grad():
             outputs = self.model(**batch)
-            self._handle_outputs(outputs, batch)
+            self.handle_outputs(outputs, batch, self.specs['per_device_eval_batch_size'], 
+                                self.losses, self.metric)
         logging.info(f"Finished evaluating step {step}")
-
-    def _handle_outputs(self, outputs, batch):
-        """
-        Handle the outputs from the model.
-        
-        Args:
-            outputs: The outputs from the model.
-            batch: The batch of data associated with the outputs.
-        """
-        # Example logic for handling outputs
-        if self.task_type == "question_answering":
-            self.start_logits.append(outputs.start_logits.cpu().numpy())
-            self.end_logits.append(outputs.end_logits.cpu().numpy())
-        else:
-            self.losses.append(outputs.loss.cpu().numpy())
 
     def _compute_metrics(self):
         """
@@ -418,28 +404,32 @@ class AcceleratedNLPSeq2SeqTrainer():
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
                 task_type, optimizer, chosen_metric):
-        self.model = model
-        self.optimizer = optimizer
-        self.data_collator = data_collator
-        self.datasets = {"train": train_dataset, "eval": eval_dataset}
-        self.raw_dataset = raw_dataset
-        self.tokenizer = tokenizer
-        
-        self.setup_configuration(args_dir)
-        self.prepare_with_accelerator(train_dataset, eval_dataset)
-        self.prepare_scheduler()
+        try:
+            self.model = model
+            self.optimizer = optimizer
+            self.data_collator = data_collator
+            self.datasets = {"train": train_dataset, "eval": eval_dataset}
+            self.raw_dataset = raw_dataset
+            self.tokenizer = tokenizer
+            
+            self.setup_configuration()
+            self.prepare_with_accelerator(train_dataset, eval_dataset)
+            self.prepare_scheduler()
 
-        self.progress_bar = tqdm(range(self.num_training_steps | 1))
-        self.task_type = task_type
-        self.losses = []
-        self.metric = evaluate.load(chosen_metric)
+            self.progress_bar = tqdm(range(self.num_training_steps | 1))
+            self.task_type = task_type
+            self.losses = []
+            self.metric = evaluate.load(chosen_metric)
+            Logger.info("AcceleratedNLPSeq2SeqTrainer initialized successfully.")
+        except Exception as e:
+            ErrorHandler.handle_error(e, "AcceleratedNLPSeq2SeqTrainer initialization")
 
-    def setup_configuration(self, args_dir):
+    def setup_configuration(self):
         """
-        Set up configuration using the default specs and additional arguments.
+        Set up configuration using ConfigManager.
         """
-        specs = json.load(open(args_dir, 'r'))
-        self.specs = {**DEFAULT_SPECS, **specs}
+        config_manager = ConfigManager()
+        self.specs = vars(config_manager.parse_args())
 
     def prepare_with_accelerator(self, train_dataset, eval_dataset):
         #prepare data loader
@@ -460,7 +450,9 @@ class AcceleratedNLPSeq2SeqTrainer():
             dataset, 
             shuffle=shuffle, 
             collate_fn=self.data_collator, 
-            batch_size=batch_size
+            batch_size=batch_size,
+            pin_memory=True,
+            num_workers=4
         )
         
         return self.dataloader
@@ -622,44 +614,67 @@ class AcceleratedNLPSeq2SeqTrainer():
 
     def train(self):
         for epoch in range(self.num_train_epochs):
-            print("Currently in epoch", epoch)
+            logging.info(f"Starting epoch {epoch}")
 
             self.model.train()
-            #Training with forward & backward pass
-            for batch in self.train_dataloader:
-                outputs = self.model(**batch)
-                loss = outputs.loss
-                self.accelerator.backward(loss)
-
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-                self.progress_bar.update(1)
+            for step, batch in enumerate(self.train_dataloader):
+                self._train_step(batch, step)
             
             self.model.eval()
-            if self.task_type == "question_answering":
-                self.start_logits = []
-                self.end_logits = []
-
             for step, batch in enumerate(self.eval_dataloader):
-                with torch.no_grad():
-                    outputs = self.model(**batch)
-                    self.handle_outputs(outputs, batch, self.specs['per_device_eval_batch_size'], 
-                                    self.losses, self.metric)
-                print("Finished evaluating step", step)
+                self._eval_step(batch, step)
 
-            losses = torch.cat(self.losses)
-            losses = losses[: len(self.datasets['eval'])]
-            print("Losses:", losses)
-
-            if self.task_type == "question_answering":
-                self.start_logits = np.concatenate(self.start_logits)
-                self.end_logits = np.concatenate(self.end_logits)
-                self.compute_qna_metrics(self.start_logits, self.end_logits, self.eval_dataset, self.raw_dataset['eval'])
-            else:
-                self.metric.compute()
-            
+            self._compute_metrics()
             self.save_and_upload(epoch)
+            logging.info(f"Completed epoch {epoch}")
+
+    def _train_step(self, batch, step):
+        """
+        Perform a single training step.
+        
+        Args:
+            batch: The batch of data for the current step.
+            step: The current step number.
+        """
+        with self.accelerator.autocast():  # Use mixed precision
+            outputs = self.model(**batch)
+            loss = outputs.loss / self.specs['gradient_accumulation_steps']
+        self.accelerator.backward(loss)
+
+        if (step + 1) % self.specs['gradient_accumulation_steps'] == 0:
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            self.progress_bar.update(1)
+
+    def _eval_step(self, batch, step):
+        """
+        Perform a single evaluation step.
+        
+        Args:
+            batch: The batch of data for the current step.
+            step: The current step number.
+        """
+        with torch.no_grad():
+            outputs = self.model(**batch)
+            self.handle_outputs(outputs, batch, self.specs['per_device_eval_batch_size'], 
+                                self.losses, self.metric)
+        logging.info(f"Finished evaluating step {step}")
+
+    def _compute_metrics(self):
+        """
+        Compute and log metrics after evaluation.
+        """
+        losses = torch.cat(self.losses)
+        losses = losses[: len(self.datasets['eval'])]
+        logging.info(f"Losses: {losses}")
+
+        if self.task_type == "question_answering":
+            self.start_logits = np.concatenate(self.start_logits)
+            self.end_logits = np.concatenate(self.end_logits)
+            self.compute_qna_metrics(self.start_logits, self.end_logits, self.eval_dataset, self.raw_dataset['eval'])
+        else:
+            self.metric.compute()
 
     def print_args(self):
         print(self.specs)
