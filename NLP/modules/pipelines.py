@@ -19,6 +19,8 @@ from pretrain_modules import PretrainModules
 from dataset_modules import DatasetModules
 from classes.accelerated_trainers import AcceleratedNLPTrainer, AcceleratedNLPSeq2SeqTrainer
 from classes.trainers import NLPTrainer, NLPSeq2SeqTrainer
+from classes.accelerated_trainers_with_lightning import AcceleratedNLPTrainer as AcceleratedNLPTrainerWithLightning, AcceleratedNLPSeq2SeqTrainer as AcceleratedNLPSeq2SeqTrainerWithLightning
+from classes.trainers_with_lightning import NLPTrainer as NLPTrainerWithLightning, NLPSeq2SeqTrainer as NLPSeq2SeqTrainerWithLightning
 from configs.default_config import DEFAULT_SPECS
 from adapter_manager import MultiAdapterManager
 
@@ -300,7 +302,7 @@ class FineTunePipeLine():
     def __init__(self, args_dir, task_type, checkpoint, dataset_name, 
                 dataset_config_name=None, text_column=None, summary_column=None, 
                 use_bert=False, use_accelerate=False, chosen_metric="accuracy",
-                peft_method=None, peft_config=None, quantization=None):
+                peft_method=None, peft_config=None, quantization=None, use_lightning=False):
         """Initialize the fine-tuning pipeline.
         
         Args:
@@ -317,6 +319,7 @@ class FineTunePipeLine():
             peft_method: Parameter-efficient fine-tuning method to use (None, "lora", "qlora", etc.)
             peft_config: Configuration for the PEFT method
             quantization: Quantization type to use (None, "4bit", "8bit")
+            use_lightning: Whether to use Lightning for training
         """
         self.args_dir = args_dir
         self.task_type = task_type
@@ -331,6 +334,7 @@ class FineTunePipeLine():
         self.peft_method = peft_method
         self.peft_config = peft_config or {}
         self.quantization = quantization
+        self.use_lightning = use_lightning
         
         specs = json.load(open(args_dir, 'r'))
         self.specs = {**DEFAULT_SPECS, **specs}
@@ -340,6 +344,30 @@ class FineTunePipeLine():
         self.pretrain_modules = PretrainModules(checkpoint, use_bert)
         self.dataset_modules = DatasetModules(dataset_name, dataset_config_name, text_column, summary_column)
         
+        # Initialize the appropriate trainer
+        if self.use_lightning:
+            if self.use_accelerate:
+                if self.task_type in ["summarization", "translation"]:
+                    self.trainer_class = AcceleratedNLPSeq2SeqTrainerWithLightning
+                else:
+                    self.trainer_class = AcceleratedNLPTrainerWithLightning
+            else:
+                if self.task_type in ["summarization", "translation"]:
+                    self.trainer_class = NLPSeq2SeqTrainerWithLightning
+                else:
+                    self.trainer_class = NLPTrainerWithLightning
+        else:
+            if self.use_accelerate:
+                if self.task_type in ["summarization", "translation"]:
+                    self.trainer_class = AcceleratedNLPSeq2SeqTrainer
+                else:
+                    self.trainer_class = AcceleratedNLPTrainer
+            else:
+                if self.task_type in ["summarization", "translation"]:
+                    self.trainer_class = NLPSeq2SeqTrainer
+                else:
+                    self.trainer_class = NLPTrainer
+    
     def run(self):
         # Load model and tokenizer
         model = self.model_modules.load_model(self.task_type, self.quantization)
@@ -377,36 +405,25 @@ class FineTunePipeLine():
         # Define optimizer
         optimizer = torch.optim.AdamW(model.parameters(), lr=float(self.specs["learning_rate"]))
         
-        # Train model
-        if self.use_accelerate:
-            if self.task_type == "translation" or self.task_type == "summarization" or self.task_type == "text_generation":
-                trainer = AcceleratedNLPSeq2SeqTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, raw_dataset,
-                    self.task_type, optimizer, self.chosen_metric
-                )
-            else:
-                trainer = AcceleratedNLPTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, raw_dataset,
-                    self.task_type, optimizer, self.chosen_metric
-                )
-        else:
-            if self.task_type == "translation" or self.task_type == "summarization" or self.task_type == "text_generation":
-                trainer = NLPSeq2SeqTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, 
-                    self.task_type, optimizer
-                )
-            else:
-                trainer = NLPTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, 
-                    self.task_type, optimizer
-                )
+        # Initialize the trainer
+        trainer = self.trainer_class(
+            args_dir=self.args_dir,
+            model=model,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            raw_dataset=raw_dataset,
+            task_type=self.task_type,
+            optimizer=optimizer,
+            chosen_metric=self.chosen_metric
+        )
         
-        # Train model
-        trainer.train()
+        # Run the training process
+        if self.use_lightning:
+            trainer.fit()
+        else:
+            trainer.train()
         
         # Save model
         if self.peft_method:
