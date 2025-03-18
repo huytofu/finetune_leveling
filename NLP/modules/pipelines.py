@@ -59,7 +59,7 @@ class InferencePipeLine():
             raise ValueError(f"Unsupported task type: {task_type}")
         
         # Initialize adapter support if configured
-        self.multi_adapter_manager = None
+        self.adapter_manager = None
         self.has_adapter_support = False
         
         if adapter_config is not None:
@@ -75,7 +75,7 @@ class InferencePipeLine():
         preload_adapters = adapter_config.get('preload_adapters', [])
         
         # Initialize MultiAdapterManager
-        self.multi_adapter_manager = MultiAdapterManager(
+        self.adapter_manager = MultiAdapterManager(
             base_model=self.loaded_pipeline.model,
             cache_dir=cache_dir,
             max_adapters_in_memory=max_adapters,
@@ -95,7 +95,7 @@ class InferencePipeLine():
                 if source == 'local':
                     path = adapter_conf.get('path')
                     if path:
-                        self.multi_adapter_manager.register_adapter_from_local(
+                        self.adapter_manager.register_adapter_from_local(
                             adapter_id=adapter_id,
                             adapter_path=path,
                             adapter_name=adapter_conf.get('adapter_name'),
@@ -106,7 +106,7 @@ class InferencePipeLine():
                 elif source == 'huggingface':
                     repo_id = adapter_conf.get('repo_id')
                     if repo_id:
-                        self.multi_adapter_manager.register_adapter_from_huggingface(
+                        self.adapter_manager.register_adapter_from_huggingface(
                             adapter_id=adapter_id,
                             repo_id=repo_id,
                             adapter_name=adapter_conf.get('adapter_name'),
@@ -120,7 +120,7 @@ class InferencePipeLine():
                     bucket = adapter_conf.get('bucket')
                     prefix = adapter_conf.get('prefix')
                     if bucket and prefix:
-                        self.multi_adapter_manager.register_adapter_from_aws(
+                        self.adapter_manager.register_adapter_from_aws(
                             adapter_id=adapter_id,
                             bucket=bucket,
                             prefix=prefix,
@@ -133,7 +133,7 @@ class InferencePipeLine():
                     bucket = adapter_conf.get('bucket')
                     prefix = adapter_conf.get('prefix')
                     if bucket and prefix:
-                        self.multi_adapter_manager.register_adapter_from_gcp(
+                        self.adapter_manager.register_adapter_from_gcp(
                             adapter_id=adapter_id,
                             bucket=bucket,
                             prefix=prefix,
@@ -147,114 +147,6 @@ class InferencePipeLine():
         
         self.has_adapter_support = True
     
-    def register_adapter(self, adapter_config):
-        """
-        Register a new adapter
-        
-        Args:
-            adapter_config: Configuration for the adapter
-                {
-                    'source': str,         # 'local', 'huggingface', 'aws', 'gcp'
-                    'adapter_id': str,     # Unique identifier
-                    ... source-specific parameters ...
-                }
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        if not self.has_adapter_support:
-            raise ValueError("Adapter support not initialized")
-        
-        source = adapter_config.get('source', 'local')
-        adapter_id = adapter_config.get('adapter_id')
-        
-        if not adapter_id:
-            raise ValueError("adapter_id is required")
-        
-        try:
-            if source == 'local':
-                path = adapter_config.get('path')
-                if not path:
-                    raise ValueError("path is required for local adapters")
-                
-                self.multi_adapter_manager.register_adapter_from_local(
-                    adapter_id=adapter_id,
-                    adapter_path=path,
-                    adapter_name=adapter_config.get('adapter_name'),
-                    adapter_type=adapter_config.get('adapter_type', 'lora'),
-                    metadata=adapter_config.get('metadata')
-                )
-            
-            elif source == 'huggingface':
-                repo_id = adapter_config.get('repo_id')
-                if not repo_id:
-                    raise ValueError("repo_id is required for Hugging Face adapters")
-                
-                self.multi_adapter_manager.register_adapter_from_huggingface(
-                    adapter_id=adapter_id,
-                    repo_id=repo_id,
-                    adapter_name=adapter_config.get('adapter_name'),
-                    adapter_type=adapter_config.get('adapter_type', 'lora'),
-                    metadata=adapter_config.get('metadata'),
-                    revision=adapter_config.get('revision', 'main'),
-                    use_auth_token=adapter_config.get('use_auth_token')
-                )
-            
-            elif source == 'aws':
-                bucket = adapter_config.get('bucket')
-                prefix = adapter_config.get('prefix')
-                if not bucket or not prefix:
-                    raise ValueError("bucket and prefix are required for AWS adapters")
-                
-                self.multi_adapter_manager.register_adapter_from_aws(
-                    adapter_id=adapter_id,
-                    bucket=bucket,
-                    prefix=prefix,
-                    adapter_name=adapter_config.get('adapter_name'),
-                    adapter_type=adapter_config.get('adapter_type', 'lora'),
-                    metadata=adapter_config.get('metadata')
-                )
-            
-            elif source == 'gcp':
-                bucket = adapter_config.get('bucket')
-                prefix = adapter_config.get('prefix')
-                if not bucket or not prefix:
-                    raise ValueError("bucket and prefix are required for GCP adapters")
-                
-                self.multi_adapter_manager.register_adapter_from_gcp(
-                    adapter_id=adapter_id,
-                    bucket=bucket,
-                    prefix=prefix,
-                    adapter_name=adapter_config.get('adapter_name'),
-                    adapter_type=adapter_config.get('adapter_type', 'lora'),
-                    metadata=adapter_config.get('metadata')
-                )
-            
-            else:
-                raise ValueError(f"Unsupported adapter source: {source}")
-            
-            return True
-            
-        except Exception as e:
-            import logging
-            logging.error(f"Failed to register adapter {adapter_id}: {str(e)}")
-            return False
-    
-    def unregister_adapter(self, adapter_id):
-        """
-        Unregister an adapter
-        
-        Args:
-            adapter_id: ID of adapter to unregister
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        if not self.has_adapter_support:
-            raise ValueError("Adapter support not initialized")
-        
-        return self.multi_adapter_manager.unregister_adapter(adapter_id)
-    
     def list_adapters(self):
         """
         List all registered adapters
@@ -265,7 +157,7 @@ class InferencePipeLine():
         if not self.has_adapter_support:
             return []
         
-        adapter_list = self.multi_adapter_manager.list_adapters()
+        adapter_list = self.adapter_manager.list_adapters()
         return [
             {
                 'id': a.adapter_id,
@@ -277,23 +169,33 @@ class InferencePipeLine():
             for a in adapter_list
         ]
     
-    def run(self, input_text, adapter_id=None, **kwargs):
+    def run(self, input_text, adapter_id=None, auto_adapter=False, select_adapter_with_llm=False, **kwargs):
         """
         Run inference with the model
         
         Args:
             input_text: Input text for the model
             adapter_id: Optional adapter ID to use for inference
+            auto_adapter: If True, let the system decide which adapter to use
+            select_adapter_with_llm: If True, use LLM to decide the best adapter
             **kwargs: Additional arguments for the model
             
         Returns:
             Model output
         """
+        # Determine adapter if auto_adapter is enabled
+        if auto_adapter:
+            if select_adapter_with_llm:
+                adapter_id = self._select_best_adapter_with_llm(input_text)
+            else:
+                adapter_id = self._select_best_adapter(input_text)
+            print(f"System selected adapter: {adapter_id}")
+
         # Use adapter if specified and adapter support is enabled
         if adapter_id and self.has_adapter_support:
             try:
                 # Load the specified adapter
-                adapter_model = self.multi_adapter_manager.load_adapter(adapter_id)
+                adapter_model = self.adapter_manager.load_adapter(adapter_id)
                 
                 # Create a temporary pipeline with the adapter model
                 temp_pipeline = None
@@ -354,6 +256,45 @@ class InferencePipeLine():
                 return_text=True
             )[0]["generated_text"]
         return self.loaded_pipeline(input_text)
+
+    def _select_best_adapter(self, input_text):
+        """
+        Select the most suitable adapter based on the input text or task type.
+        """
+        # Placeholder logic for selecting the best adapter
+        # This can be replaced with more sophisticated logic based on task type, input text, etc.
+        adapters = self.adapter_manager.list_adapters()
+        if not adapters:
+            return None
+        
+        # Example: Select the first available adapter
+        return adapters[0]['id']
+
+    def _select_best_adapter_with_llm(self, input_text):
+        """
+        Use the base model to decide the best adapter based on adapter names.
+        """
+        # Construct a prompt for the model
+        prompt = """
+        You are a smart AI model. Based on the following task and available adapters, choose the most suitable adapter:
+        Task: {task_type}
+        Available Adapters: {adapters}
+        Choose the best adapter name:
+        """.format(
+            task_type=self.task_type,
+            adapters=', '.join([a['name'] for a in self.adapter_manager.list_adapters()])
+        )
+
+        # Use the base model to generate a response
+        response = self.loaded_pipeline(prompt, max_length=50, return_text=True)[0]['generated_text']
+
+        # Extract the adapter name from the response
+        for adapter in self.adapter_manager.list_adapters():
+            if adapter['name'] in response:
+                return adapter['id']
+
+        # Fallback to the first adapter if no match is found
+        return self.adapter_manager.list_adapters()[0]['id']
 
 class FineTunePipeLine():
     def __init__(self, args_dir, task_type, checkpoint, dataset_name, 

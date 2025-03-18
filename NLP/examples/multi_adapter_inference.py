@@ -48,6 +48,10 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for sampling")
     
+    # New option for automatic adapter selection
+    parser.add_argument("--auto_adapter", action="store_true",
+                        help="Let the system decide which adapter to use")
+    
     return parser.parse_args()
 
 def main():
@@ -101,7 +105,8 @@ def main():
     
     # Interactive mode
     print("\n=== Interactive Inference ===")
-    print("Type 'exit' to quit, 'adapters' to list adapters, or 'adapter NAME' to switch adapter")
+    print("Type 'exit' to quit, 'adapters' to list adapters, 'adapter NAME' to switch adapter")
+    print("Additional commands: 'register_local PATH ID', 'register_hf REPO_ID ID', 'unregister ID'")
     
     current_adapter = None
     while True:
@@ -138,6 +143,65 @@ def main():
                     print(f"Switched to adapter: {current_adapter}")
                 else:
                     print(f"Adapter '{adapter_name}' not found")
+            continue
+        elif user_input.lower().startswith('register_local '):
+            # Format: register_local PATH ID [NAME]
+            args = user_input[14:].strip().split()
+            if len(args) < 2:
+                print("Usage: register_local PATH ID [NAME]")
+                continue
+                
+            path = args[0]
+            adapter_id = args[1]
+            adapter_name = args[2] if len(args) > 2 else adapter_id
+            
+            try:
+                pipeline.adapter_manager.register_adapter_from_local(
+                    adapter_id=adapter_id,
+                    adapter_path=path,
+                    adapter_name=adapter_name
+                )
+                print(f"Registered local adapter: {adapter_id}")
+            except Exception as e:
+                print(f"Failed to register adapter: {str(e)}")
+            continue
+        elif user_input.lower().startswith('register_hf '):
+            # Format: register_hf REPO_ID ID [NAME]
+            args = user_input[12:].strip().split()
+            if len(args) < 2:
+                print("Usage: register_hf REPO_ID ID [NAME]")
+                continue
+                
+            repo_id = args[0]
+            adapter_id = args[1]
+            adapter_name = args[2] if len(args) > 2 else adapter_id
+            
+            try:
+                pipeline.adapter_manager.register_adapter_from_huggingface(
+                    adapter_id=adapter_id,
+                    repo_id=repo_id,
+                    adapter_name=adapter_name,
+                    use_auth_token=args.hf_token
+                )
+                print(f"Registered Hugging Face adapter: {adapter_id}")
+            except Exception as e:
+                print(f"Failed to register adapter: {str(e)}")
+            continue
+        elif user_input.lower().startswith('unregister '):
+            # Format: unregister ID
+            adapter_id = user_input[11:].strip()
+            
+            try:
+                result = pipeline.adapter_manager.unregister_adapter(adapter_id)
+                if result:
+                    print(f"Unregistered adapter: {adapter_id}")
+                    if current_adapter == adapter_id:
+                        current_adapter = None
+                        print("Switched to base model")
+                else:
+                    print(f"Adapter not found: {adapter_id}")
+            except Exception as e:
+                print(f"Failed to unregister adapter: {str(e)}")
             continue
         
         # Regular inference
