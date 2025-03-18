@@ -2,11 +2,29 @@ from datasets import load_dataset
 
 class DatasetModules():
     def __init__(self, dataset_dir, tokenizer, specs):
+        """
+        Initialize the DatasetModules.
+        
+        Args:
+            dataset_dir: Directory containing the dataset.
+            tokenizer: The tokenizer to use for data processing.
+            specs: Specifications for dataset processing.
+        """
         self.dataset_dir = dataset_dir
         self.tokenizer = tokenizer
         self.specs = specs
 
     def align_labels_with_tokens(self, labels, word_ids):
+        """
+        Align labels with tokenized word IDs.
+        
+        Args:
+            labels: Original labels for the dataset.
+            word_ids: Word IDs from tokenization.
+        
+        Returns:
+            List of aligned labels.
+        """
         new_labels = []
         current_word = None
         for word_id in word_ids:
@@ -29,8 +47,17 @@ class DatasetModules():
         return new_labels
     
     def tokenize_dataset(self, examples):
-        # TO QC LATER
+        """
+        Tokenize the dataset examples.
+        
+        Args:
+            examples: Dataset examples to tokenize.
+        
+        Returns:
+            Tokenized dataset.
+        """
         if self.task_type == "token_classification":
+            # Tokenize inputs for token classification
             self.tokenized_dataset = self.tokenizer(examples['inputs'],
                                                     is_split_into_words=True, truncation=True,
                                                     return_offsets_mapping=True)

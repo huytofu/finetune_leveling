@@ -11,6 +11,14 @@ from configs.default_config import DEFAULT_SPECS
 
 class PretrainModules():
     def __init__(self, args_dir, tokenizer, model):
+        """
+        Initialize the PretrainModules.
+        
+        Args:
+            args_dir: Directory containing configuration arguments.
+            tokenizer: The tokenizer to use for data processing.
+            model: The model to be pre-trained.
+        """
         specs = {}
         if args_dir is not None:
             specs = json.load(open(args_dir, 'r'))
@@ -19,6 +27,15 @@ class PretrainModules():
         self.model = model
 
     def prepare_optimizer(self, type):
+        """
+        Prepare the optimizer for training.
+        
+        Args:
+            type: The type of optimizer to use (e.g., 'adamw').
+        
+        Returns:
+            The prepared optimizer.
+        """
         if type == "adamw":
             optimizer = AdamW(
                 self.model.parameters(), 
@@ -30,12 +47,22 @@ class PretrainModules():
         return optimizer
 
     def prepare_data_collator(self, task_type):
+        """
+        Prepare the data collator for the specified task type.
+        
+        Args:
+            task_type: The type of task (e.g., 'masked_language_modeling').
+        
+        Returns:
+            The prepared data collator.
+        """
         if task_type == "masked_language_modeling":
-            #Need to add mlm probability = % of tokens to randomly mask
+            # Data collator for masked language modeling
             data_collator = DataCollatorForLanguageModeling(
                 tokenizer=self.tokenizer, mlm_probability=self.specs['mlm_probability']
             )
         elif task_type == "token_classification":
+            # Data collator for token classification
             data_collator = DataCollatorForTokenClassification(
                 tokenizer=self.tokenizer
             )

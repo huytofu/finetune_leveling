@@ -5,19 +5,32 @@ import torch
 from typing import Dict, Optional, Union, List
 
 class ModelModules():
+    """
+    A class to manage model loading and application of Parameter-Efficient Fine-Tuning (PEFT) methods.
+    """
+    
     def __init__(self, checkpoint, use_bert=False):
+        """
+        Initialize the ModelModules.
+        
+        Args:
+            checkpoint (str): Path to the model checkpoint.
+            use_bert (bool): Whether to use BERT-specific models.
+        """
+        # Store the checkpoint and BERT usage flag
         self.checkpoint = checkpoint
         self.use_bert = use_bert
         
     def load_model(self, task_type, quantization=None):
-        """Load model with optional quantization.
+        """
+        Load a model with optional quantization.
         
         Args:
-            task_type: The type of task
-            quantization: Quantization type ("4bit", "8bit", or None)
+            task_type (str): The type of task (e.g., 'masked_language_modeling', 'token_classification').
+            quantization (Optional[str]): Quantization type ('4bit', '8bit', or None).
             
         Returns:
-            The loaded model
+            model: The loaded model, potentially with quantization applied.
         """
         # Prepare quantization config if needed
         quantization_config = None
@@ -93,17 +106,19 @@ class ModelModules():
         return model
         
     def apply_peft(self, model, tokenizer, peft_method, peft_config, task_type):
-        """Apply PEFT method to the model.
+        """
+        Apply a Parameter-Efficient Fine-Tuning (PEFT) method to the model.
         
         Args:
-            model: The model to apply PEFT to
-            tokenizer: The tokenizer
-            peft_method: The PEFT method to use (e.g., "lora", "qlora", "prefix_tuning")
-            peft_config: Configuration for the PEFT method
-            task_type: The type of task
+            model: The model to apply PEFT to.
+            tokenizer: The tokenizer associated with the model.
+            peft_method (str): The PEFT method to use (e.g., 'lora', 'qlora', 'prefix_tuning').
+            peft_config (dict): Configuration for the PEFT method.
+            task_type (str): The type of task.
             
         Returns:
-            The model with PEFT applied and the tokenizer
+            model: The model with PEFT applied.
+            tokenizer: The tokenizer, potentially modified by the PEFT method.
         """
         from .peft_modules import PEFTModules
         

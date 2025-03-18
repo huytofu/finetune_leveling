@@ -40,24 +40,25 @@ class PEFTModules:
         r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
-        target_modules: Optional[Union[List[str], str]] = None,
+        target_modules: Optional[List[str]] = None,
         bias: str = "none",
         modules_to_save: Optional[List[str]] = None
     ) -> PeftModel:
-        """Apply LoRA to a model.
+        """
+        Apply LoRA (Low-Rank Adaptation) to the model.
         
         Args:
-            model: The model to apply LoRA to
-            task_type: The type of task
-            r: LoRA rank
-            lora_alpha: LoRA alpha parameter
-            lora_dropout: Dropout probability for LoRA layers
-            target_modules: Which modules to apply LoRA to (if None, will try to infer)
-            bias: Bias type ("none", "all", or "lora_only")
-            modules_to_save: List of modules apart from LoRA layers to be set as trainable
-            
+            model: The model to apply LoRA to.
+            task_type: The type of task.
+            r: Rank of the low-rank adaptation.
+            lora_alpha: Scaling factor for LoRA.
+            lora_dropout: Dropout rate for LoRA.
+            target_modules: Specific modules to target for LoRA.
+            bias: Bias configuration for LoRA.
+            modules_to_save: Modules to save during LoRA application.
+        
         Returns:
-            The model with LoRA applied
+            PeftModel: The model with LoRA applied.
         """
         # If target_modules is None, try to infer based on model architecture
         if target_modules is None:
