@@ -4,3 +4,10 @@
 *.xlsx
 /Data
 /Models
+
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz

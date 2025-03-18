@@ -5,6 +5,7 @@ import collections
 import json
 import os
 import sys
+import torch
 currdir = os.path.dirname(os.path.abspath(__file__))
 parentdir = os.path.dirname(currdir)
 sys.path.append(currdir)
@@ -19,11 +20,29 @@ from dataset_modules import DatasetModules
 from classes.accelerated_trainers import AcceleratedNLPTrainer, AcceleratedNLPSeq2SeqTrainer
 from classes.trainers import NLPTrainer, NLPSeq2SeqTrainer
 from configs.default_config import DEFAULT_SPECS
+from adapter_manager import MultiAdapterManager
 
 class InferencePipeLine():
-    def __init__(self, task_type, checkpoint):
+    def __init__(self, task_type, checkpoint, adapter_config=None):
+        """
+        Initialize the inference pipeline.
+        
+        Args:
+            task_type: Type of task (text_generation, summarization, etc.)
+            checkpoint: Path to the model checkpoint
+            adapter_config: Configuration for adapter support (optional)
+                {
+                    'cache_dir': str,          # Directory to cache adapters
+                    'max_adapters': int,       # Maximum number of adapters in memory
+                    'aws_credentials': dict,   # AWS credentials
+                    'gcp_credentials': str,    # Path to GCP credentials file
+                    'preload_adapters': list   # List of adapter configurations to preload
+                }
+        """
         self.task_type = task_type.replace("_","-")
         self.specs = {**DEFAULT_SPECS}
+        
+        # Create the base pipeline without adapters
         if task_type == "token_classification":
             self.loaded_pipeline = pipeline(self.task_type, model=checkpoint, aggregation_strategy="simple")     
         elif task_type == "masked_language_modeling":
@@ -36,32 +55,430 @@ class InferencePipeLine():
             self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
         elif task_type == "text_generation":
             self.loaded_pipeline = pipeline(self.task_type, model=checkpoint)
-        else: pass
+        else: 
+            raise ValueError(f"Unsupported task type: {task_type}")
+        
+        # Initialize adapter support if configured
+        self.multi_adapter_manager = None
+        self.has_adapter_support = False
+        
+        if adapter_config is not None:
+            self._initialize_adapter_support(checkpoint, adapter_config)
     
-    def run(self, input_text):
+    def _initialize_adapter_support(self, checkpoint, adapter_config):
+        """Initialize adapter support with the given configuration"""
+        # Extract configuration
+        cache_dir = adapter_config.get('cache_dir')
+        max_adapters = adapter_config.get('max_adapters', 5)
+        aws_credentials = adapter_config.get('aws_credentials')
+        gcp_credentials = adapter_config.get('gcp_credentials')
+        preload_adapters = adapter_config.get('preload_adapters', [])
+        
+        # Initialize MultiAdapterManager
+        self.multi_adapter_manager = MultiAdapterManager(
+            base_model=self.loaded_pipeline.model,
+            cache_dir=cache_dir,
+            max_adapters_in_memory=max_adapters,
+            aws_credentials=aws_credentials,
+            gcp_credentials=gcp_credentials
+        )
+        
+        # Preload adapters if specified
+        for adapter_conf in preload_adapters:
+            source = adapter_conf.get('source', 'local')
+            adapter_id = adapter_conf.get('adapter_id')
+            
+            if not adapter_id:
+                continue
+                
+            try:
+                if source == 'local':
+                    path = adapter_conf.get('path')
+                    if path:
+                        self.multi_adapter_manager.register_adapter_from_local(
+                            adapter_id=adapter_id,
+                            adapter_path=path,
+                            adapter_name=adapter_conf.get('adapter_name'),
+                            adapter_type=adapter_conf.get('adapter_type', 'lora'),
+                            metadata=adapter_conf.get('metadata')
+                        )
+                
+                elif source == 'huggingface':
+                    repo_id = adapter_conf.get('repo_id')
+                    if repo_id:
+                        self.multi_adapter_manager.register_adapter_from_huggingface(
+                            adapter_id=adapter_id,
+                            repo_id=repo_id,
+                            adapter_name=adapter_conf.get('adapter_name'),
+                            adapter_type=adapter_conf.get('adapter_type', 'lora'),
+                            metadata=adapter_conf.get('metadata'),
+                            revision=adapter_conf.get('revision', 'main'),
+                            use_auth_token=adapter_conf.get('use_auth_token')
+                        )
+                
+                elif source == 'aws':
+                    bucket = adapter_conf.get('bucket')
+                    prefix = adapter_conf.get('prefix')
+                    if bucket and prefix:
+                        self.multi_adapter_manager.register_adapter_from_aws(
+                            adapter_id=adapter_id,
+                            bucket=bucket,
+                            prefix=prefix,
+                            adapter_name=adapter_conf.get('adapter_name'),
+                            adapter_type=adapter_conf.get('adapter_type', 'lora'),
+                            metadata=adapter_conf.get('metadata')
+                        )
+                
+                elif source == 'gcp':
+                    bucket = adapter_conf.get('bucket')
+                    prefix = adapter_conf.get('prefix')
+                    if bucket and prefix:
+                        self.multi_adapter_manager.register_adapter_from_gcp(
+                            adapter_id=adapter_id,
+                            bucket=bucket,
+                            prefix=prefix,
+                            adapter_name=adapter_conf.get('adapter_name'),
+                            adapter_type=adapter_conf.get('adapter_type', 'lora'),
+                            metadata=adapter_conf.get('metadata')
+                        )
+            except Exception as e:
+                import logging
+                logging.error(f"Failed to preload adapter {adapter_id}: {str(e)}")
+        
+        self.has_adapter_support = True
+    
+    def register_adapter(self, adapter_config):
+        """
+        Register a new adapter
+        
+        Args:
+            adapter_config: Configuration for the adapter
+                {
+                    'source': str,         # 'local', 'huggingface', 'aws', 'gcp'
+                    'adapter_id': str,     # Unique identifier
+                    ... source-specific parameters ...
+                }
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.has_adapter_support:
+            raise ValueError("Adapter support not initialized")
+        
+        source = adapter_config.get('source', 'local')
+        adapter_id = adapter_config.get('adapter_id')
+        
+        if not adapter_id:
+            raise ValueError("adapter_id is required")
+        
+        try:
+            if source == 'local':
+                path = adapter_config.get('path')
+                if not path:
+                    raise ValueError("path is required for local adapters")
+                
+                self.multi_adapter_manager.register_adapter_from_local(
+                    adapter_id=adapter_id,
+                    adapter_path=path,
+                    adapter_name=adapter_config.get('adapter_name'),
+                    adapter_type=adapter_config.get('adapter_type', 'lora'),
+                    metadata=adapter_config.get('metadata')
+                )
+            
+            elif source == 'huggingface':
+                repo_id = adapter_config.get('repo_id')
+                if not repo_id:
+                    raise ValueError("repo_id is required for Hugging Face adapters")
+                
+                self.multi_adapter_manager.register_adapter_from_huggingface(
+                    adapter_id=adapter_id,
+                    repo_id=repo_id,
+                    adapter_name=adapter_config.get('adapter_name'),
+                    adapter_type=adapter_config.get('adapter_type', 'lora'),
+                    metadata=adapter_config.get('metadata'),
+                    revision=adapter_config.get('revision', 'main'),
+                    use_auth_token=adapter_config.get('use_auth_token')
+                )
+            
+            elif source == 'aws':
+                bucket = adapter_config.get('bucket')
+                prefix = adapter_config.get('prefix')
+                if not bucket or not prefix:
+                    raise ValueError("bucket and prefix are required for AWS adapters")
+                
+                self.multi_adapter_manager.register_adapter_from_aws(
+                    adapter_id=adapter_id,
+                    bucket=bucket,
+                    prefix=prefix,
+                    adapter_name=adapter_config.get('adapter_name'),
+                    adapter_type=adapter_config.get('adapter_type', 'lora'),
+                    metadata=adapter_config.get('metadata')
+                )
+            
+            elif source == 'gcp':
+                bucket = adapter_config.get('bucket')
+                prefix = adapter_config.get('prefix')
+                if not bucket or not prefix:
+                    raise ValueError("bucket and prefix are required for GCP adapters")
+                
+                self.multi_adapter_manager.register_adapter_from_gcp(
+                    adapter_id=adapter_id,
+                    bucket=bucket,
+                    prefix=prefix,
+                    adapter_name=adapter_config.get('adapter_name'),
+                    adapter_type=adapter_config.get('adapter_type', 'lora'),
+                    metadata=adapter_config.get('metadata')
+                )
+            
+            else:
+                raise ValueError(f"Unsupported adapter source: {source}")
+            
+            return True
+            
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to register adapter {adapter_id}: {str(e)}")
+            return False
+    
+    def unregister_adapter(self, adapter_id):
+        """
+        Unregister an adapter
+        
+        Args:
+            adapter_id: ID of adapter to unregister
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.has_adapter_support:
+            raise ValueError("Adapter support not initialized")
+        
+        return self.multi_adapter_manager.unregister_adapter(adapter_id)
+    
+    def list_adapters(self):
+        """
+        List all registered adapters
+        
+        Returns:
+            list: Information about registered adapters
+        """
+        if not self.has_adapter_support:
+            return []
+        
+        adapter_list = self.multi_adapter_manager.list_adapters()
+        return [
+            {
+                'id': a.adapter_id,
+                'name': a.adapter_name,
+                'type': a.adapter_type,
+                'source': a.source,
+                'is_loaded': a.is_loaded
+            }
+            for a in adapter_list
+        ]
+    
+    def run(self, input_text, adapter_id=None, **kwargs):
+        """
+        Run inference with the model
+        
+        Args:
+            input_text: Input text for the model
+            adapter_id: Optional adapter ID to use for inference
+            **kwargs: Additional arguments for the model
+            
+        Returns:
+            Model output
+        """
+        # Use adapter if specified and adapter support is enabled
+        if adapter_id and self.has_adapter_support:
+            try:
+                # Load the specified adapter
+                adapter_model = self.multi_adapter_manager.load_adapter(adapter_id)
+                
+                # Create a temporary pipeline with the adapter model
+                temp_pipeline = None
+                
+                if self.task_type == "translation":
+                    temp_pipeline = pipeline(self.task_type, model=adapter_model)
+                    result = temp_pipeline(input_text, max_length=kwargs.get("max_length", self.specs["max_length"]), return_text=True)[0]["translation_text"]
+                
+                elif self.task_type == "summarization":
+                    temp_pipeline = pipeline(self.task_type, model=adapter_model)
+                    result = temp_pipeline(input_text, max_length=kwargs.get("max_length", self.specs["max_length"]), return_text=True)[0]["summary_text"]
+                
+                elif self.task_type == "question-answering":
+                    temp_pipeline = pipeline(self.task_type, model=adapter_model)
+                    result = temp_pipeline(input_text, max_length=kwargs.get("max_length", self.specs["max_length"]), return_text=True)[0]["answer"]
+                
+                elif self.task_type == "text-generation":
+                    temp_pipeline = pipeline(self.task_type, model=adapter_model)
+                    result = temp_pipeline(
+                        input_text, 
+                        max_length=kwargs.get("max_length", self.specs["max_length"]), 
+                        do_sample=kwargs.get("do_sample", True),
+                        temperature=kwargs.get("temperature", 0.7),
+                        top_p=kwargs.get("top_p", 0.9),
+                        top_k=kwargs.get("top_k", 50),
+                        num_return_sequences=kwargs.get("num_return_sequences", 1),
+                        return_text=True
+                    )[0]["generated_text"]
+                
+                else:
+                    temp_pipeline = pipeline(self.task_type, model=adapter_model)
+                    result = temp_pipeline(input_text)
+                
+                return result
+            
+            except Exception as e:
+                import logging
+                logging.error(f"Error using adapter {adapter_id}: {str(e)}")
+                logging.info(f"Falling back to base model")
+                # Fall back to base model
+        
+        # Use base model
         if self.task_type == "translation":
-            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["translation_text"]
+            return self.loaded_pipeline(input_text, max_length=kwargs.get("max_length", self.specs["max_length"]), return_text=True)[0]["translation_text"]
         elif self.task_type == "summarization":
-            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["summary_text"]
+            return self.loaded_pipeline(input_text, max_length=kwargs.get("max_length", self.specs["max_length"]), return_text=True)[0]["summary_text"]
         elif self.task_type == "question-answering":
-            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["answer"]
+            return self.loaded_pipeline(input_text, max_length=kwargs.get("max_length", self.specs["max_length"]), return_text=True)[0]["answer"]
         elif self.task_type == "text-generation":
-            return self.loaded_pipeline(input_text, max_length=self.specs["max_length"], return_text=True)[0]["generated_text"]
+            return self.loaded_pipeline(
+                input_text, 
+                max_length=kwargs.get("max_length", self.specs["max_length"]), 
+                do_sample=kwargs.get("do_sample", True),
+                temperature=kwargs.get("temperature", 0.7),
+                top_p=kwargs.get("top_p", 0.9),
+                top_k=kwargs.get("top_k", 50),
+                num_return_sequences=kwargs.get("num_return_sequences", 1),
+                return_text=True
+            )[0]["generated_text"]
         return self.loaded_pipeline(input_text)
 
 class FineTunePipeLine():
-    def __init__(self, task_type, checkpoint, chosen_metric, 
-                args_dir=None, dataset_dir=None, accelerated=True):
-        self.checkpoint = checkpoint
+    def __init__(self, args_dir, task_type, checkpoint, dataset_name, 
+                dataset_config_name=None, text_column=None, summary_column=None, 
+                use_bert=False, use_accelerate=False, chosen_metric="accuracy",
+                peft_method=None, peft_config=None, quantization=None):
+        """Initialize the fine-tuning pipeline.
+        
+        Args:
+            args_dir: Path to the arguments directory
+            task_type: Type of task to fine-tune for
+            checkpoint: Model checkpoint to use
+            dataset_name: Name of the dataset to use
+            dataset_config_name: Configuration name for the dataset
+            text_column: Name of the text column in the dataset
+            summary_column: Name of the summary column in the dataset
+            use_bert: Whether to use BERT models
+            use_accelerate: Whether to use Accelerate for training
+            chosen_metric: Metric to use for evaluation
+            peft_method: Parameter-efficient fine-tuning method to use (None, "lora", "qlora", etc.)
+            peft_config: Configuration for the PEFT method
+            quantization: Quantization type to use (None, "4bit", "8bit")
+        """
+        self.args_dir = args_dir
         self.task_type = task_type
-        if args_dir is not None:
-            self.args_dir = args_dir
-            specs = json.load(open(self.args_dir, 'r'))
-            self.specs = {**DEFAULT_SPECS, **specs}
-
-        self.accelerated = accelerated
-        self.dataset_dir = dataset_dir
+        self.checkpoint = checkpoint
+        self.dataset_name = dataset_name
+        self.dataset_config_name = dataset_config_name
+        self.text_column = text_column
+        self.summary_column = summary_column
+        self.use_bert = use_bert
+        self.use_accelerate = use_accelerate
         self.chosen_metric = chosen_metric
+        self.peft_method = peft_method
+        self.peft_config = peft_config or {}
+        self.quantization = quantization
+        
+        specs = json.load(open(args_dir, 'r'))
+        self.specs = {**DEFAULT_SPECS, **specs}
+        
+        self.model_modules = ModelModules(checkpoint, use_bert)
+        self.tokenizer_modules = TokenizerModules(checkpoint, use_bert)
+        self.pretrain_modules = PretrainModules(checkpoint, use_bert)
+        self.dataset_modules = DatasetModules(dataset_name, dataset_config_name, text_column, summary_column)
+        
+    def run(self):
+        # Load model and tokenizer
+        model = self.model_modules.load_model(self.task_type, self.quantization)
+        tokenizer = self.tokenizer_modules.load_tokenizer()
+        
+        # Apply PEFT if specified
+        if self.peft_method:
+            model, tokenizer = self.model_modules.apply_peft(
+                model=model,
+                tokenizer=tokenizer,
+                peft_method=self.peft_method,
+                peft_config=self.peft_config,
+                task_type=self.task_type
+            )
+        
+        # Load dataset
+        raw_dataset = self.dataset_modules.load_dataset()
+        
+        # Preprocess dataset
+        if self.task_type == "masked_language_modeling":
+            train_dataset, eval_dataset, data_collator = self.pretrain_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
+        elif self.task_type == "token_classification":
+            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_token_classification(raw_dataset, tokenizer, self.specs)
+        elif self.task_type == "translation":
+            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_translation(raw_dataset, tokenizer, self.specs)
+        elif self.task_type == "summarization":
+            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_summarization(raw_dataset, tokenizer, self.specs)
+        elif self.task_type == "text_generation":
+            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_text_generation(raw_dataset, tokenizer, self.specs)
+        elif self.task_type == "question_answering":
+            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_question_answering(raw_dataset, tokenizer, self.specs)
+        else:
+            train_dataset, eval_dataset, data_collator = None, None, None
+        
+        # Define optimizer
+        optimizer = torch.optim.AdamW(model.parameters(), lr=float(self.specs["learning_rate"]))
+        
+        # Train model
+        if self.use_accelerate:
+            if self.task_type == "translation" or self.task_type == "summarization" or self.task_type == "text_generation":
+                trainer = AcceleratedNLPSeq2SeqTrainer(
+                    self.args_dir, model, tokenizer, 
+                    data_collator, train_dataset, eval_dataset, raw_dataset,
+                    self.task_type, optimizer, self.chosen_metric
+                )
+            else:
+                trainer = AcceleratedNLPTrainer(
+                    self.args_dir, model, tokenizer, 
+                    data_collator, train_dataset, eval_dataset, raw_dataset,
+                    self.task_type, optimizer, self.chosen_metric
+                )
+        else:
+            if self.task_type == "translation" or self.task_type == "summarization" or self.task_type == "text_generation":
+                trainer = NLPSeq2SeqTrainer(
+                    self.args_dir, model, tokenizer, 
+                    data_collator, train_dataset, eval_dataset, 
+                    self.task_type, optimizer
+                )
+            else:
+                trainer = NLPTrainer(
+                    self.args_dir, model, tokenizer, 
+                    data_collator, train_dataset, eval_dataset, 
+                    self.task_type, optimizer
+                )
+        
+        # Train model
+        trainer.train()
+        
+        # Save model
+        if self.peft_method:
+            # For PEFT models, we need to save the adapter separately
+            from .peft_modules import PEFTModules
+            peft_modules = PEFTModules()
+            peft_modules.save_peft_model(model, self.specs["output_dir"])
+        else:
+            # For regular models, we can use the trainer to save
+            trainer.model.save_pretrained(self.specs["output_dir"])
+            tokenizer.save_pretrained(self.specs["output_dir"])
+        
+        return model, tokenizer
 
     def postprocess(self, predictions, labels):
         predictions = predictions.detach().cpu().clone().numpy()
@@ -176,65 +593,6 @@ class FineTunePipeLine():
         theoretical_answers = [{"id": ex["id"], "answers": ex["answers"]} for ex in raw_eval_dataset]
         result = self.metric.compute(predictions=predicted_answers, references=theoretical_answers)
         return result
-
-    def run(self):
-        model_modules = ModelModules(self.checkpoint)
-        self.model = model_modules.load_model(self.task_type)
-
-        tokenizer_modules = TokenizerModules(self.checkpoint)
-        self.tokenizer = tokenizer_modules.load_tokenizer()
-
-        pretrain_modules = PretrainModules(self.checkpoint, self.args_dir, self.tokenizer, self.model)
-
-        if self.accelerated:
-            self.optimizer = pretrain_modules.prepare_optimizer("adamw")
-            self.data_collator = pretrain_modules.prepare_data_collator(self.task_type)
-            
-            if self.task_type in ["translation", "summarization"]:
-                accerelated_trainer = AcceleratedNLPSeq2SeqTrainer(
-                    self.args_dir, self.model, self.tokenizer, 
-                    self.data_collator, self.dataset['train'], self.dataset['eval'], self.raw_dataset,
-                    self.task_type, optimizer=self.optimizer, chosen_metric=self.chosen_metric
-                )
-                accerelated_trainer.train()
-            else:
-                accerelated_trainer = AcceleratedNLPTrainer(
-                    self.args_dir, self.model, self.tokenizer, 
-                    self.data_collator, self.dataset['train'], self.dataset['eval'], self.raw_dataset,
-                    self.task_type, optimizer=self.optimizer, chosen_metric=self.chosen_metric
-                )
-                accerelated_trainer.train()
-        else:
-            if self.task_type != "question_answering":
-                compute_metrics = self.get_compute_metrics(self.task_type, self.chosen_metric)
-                if self.task_type in ["translation", "summarization", "text_generation"]:
-                    trainer = NLPSeq2SeqTrainer(
-                        self.args_dir, self.model, self.tokenizer, 
-                        self.data_collator, self.dataset['train'], self.dataset['eval'], 
-                        self.task_type, optimizer=None, compute_metrics=compute_metrics
-                    )
-                    trainer.train()
-                    trainer.evaluate()
-                else:
-                    trainer = NLPTrainer(
-                        self.args_dir, self.model, self.tokenizer, 
-                        self.data_collator, self.dataset['train'], self.dataset['eval'], 
-                        self.task_type, optimizer=None, compute_metrics=compute_metrics
-                    )
-                    trainer.train()
-                    trainer.evaluate()
-            else:
-                trainer = NLPTrainer(
-                    self.args_dir, self.model, self.tokenizer, 
-                    self.data_collator, self.dataset['train'], self.dataset['eval'], 
-                    self.task_type, optimizer=None, compute_metrics=None
-                )
-                trainer.train()
-                predictions, _, _ = trainer.predict(self.dataset['eval'])
-                start_logits, end_logits = predictions
-                max_answer_length = self.specs['max_length'] | 384
-                self.compute_qna_metrics(start_logits, end_logits, self.dataset['eval'], self.raw_dataset['eval'], 
-                                        self.chosen_metric, max_answer_length=max_answer_length)
 
 
 
