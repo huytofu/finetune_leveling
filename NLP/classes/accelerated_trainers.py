@@ -89,10 +89,7 @@ class AcceleratedNLPTrainer():
             self.raw_dataset = raw_dataset
             self.tokenizer = tokenizer
             
-            # Use ConfigManager for configuration
-            config_manager = ConfigManager()
-            self.specs = vars(config_manager.parse_args())
-            
+            self.setup_configuration()
             self.prepare_with_accelerator(train_dataset, eval_dataset)
             self.prepare_scheduler()
 
@@ -103,6 +100,13 @@ class AcceleratedNLPTrainer():
             Logger.info("AcceleratedNLPTrainer initialized successfully.")
         except Exception as e:
             ErrorHandler.handle_error(e, "AcceleratedNLPTrainer initialization")
+
+    def setup_configuration(self):
+        """
+        Set up configuration using ConfigManager.
+        """
+        config_manager = ConfigManager()
+        self.specs = vars(config_manager.parse_args())
 
     def prepare_with_accelerator(self, train_dataset, eval_dataset):
         """
@@ -138,12 +142,7 @@ class AcceleratedNLPTrainer():
         Returns:
             DataLoader: The prepared data loader.
         """
-        if slice_type == "train":
-            shuffle = True
-            batch_size = self.specs['per_device_train_batch_size']
-        else:
-            shuffle = False
-            batch_size = self.specs['per_device_eval_batch_size']
+        shuffle, batch_size = self.get_dataloader_params(slice_type)
         
         # Use dynamic padding to minimize padding token computation
         dataset.set_format('torch')
@@ -158,14 +157,22 @@ class AcceleratedNLPTrainer():
         
         return self.dataloader
     
+    def get_dataloader_params(self, slice_type):
+        """
+        Get DataLoader parameters based on slice type.
+        """
+        if slice_type == "train":
+            return True, self.specs['per_device_train_batch_size']
+        else:
+            return False, self.specs['per_device_eval_batch_size']
+    
     def prepare_scheduler(self):
         #Prepare scheduler specs
         self.scheduler_strategy = self.specs['scheduler_strategy']
         self.num_train_epochs = self.specs['num_train_epochs']
         self.num_warmup_steps = self.specs.get('num_warmup_steps', 0)
         
-        num_update_steps_per_epoch = len(self.train_dataloader)
-        self.num_training_steps = self.num_train_epochs * num_update_steps_per_epoch
+        self.calculate_training_steps()
 
         self.lr_scheduler = get_scheduler(
             self.scheduler_strategy,
@@ -174,15 +181,37 @@ class AcceleratedNLPTrainer():
             num_training_steps=self.num_training_steps,
         )
     
+    def calculate_training_steps(self):
+        """
+        Calculate the number of training steps.
+        """
+        num_update_steps_per_epoch = len(self.train_dataloader)
+        self.num_training_steps = self.num_train_epochs * num_update_steps_per_epoch
+
     def save_and_upload(self, epoch):
+        # Split into save and upload methods
+        self.save_model(epoch)
+        self.upload_model(epoch)
+
+    def save_model(self, epoch):
+        """
+        Save the model to the specified directory.
+        """
         self.accelerator.wait_for_everyone()
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         unwrapped_model.save_pretrained(self.specs['output_dir'], save_function=self.accelerator.save)
+        if self.accelerator.is_main_process:
+            self.tokenizer.save_pretrained(self.specs['output_dir'])
+
+    def upload_model(self, epoch):
+        """
+        Upload the model to the hub.
+        """
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
         unwrapped_model.push_to_hub(
             commit_message=f"Training in progress epoch {epoch}", blocking=False
         )
         if self.accelerator.is_main_process:
-            self.tokenizer.save_pretrained(self.specs['output_dir'])
             self.tokenizer.push_to_hub(
                 commit_message=f"Training in progress epoch {epoch}", blocking=False
             )
@@ -202,9 +231,7 @@ class AcceleratedNLPTrainer():
 
     def compute_qna_metrics(self, start_logits, end_logits, eval_dataset, raw_eval_dataset, chosen_metric, max_answer_length):
         self.metric = evaluate.load_metric(chosen_metric)
-        example_to_features = collections.defaultdict(list)
-        for idx, feature in enumerate(eval_dataset):
-            example_to_features[feature["example_id"]].append(idx)
+        example_to_features = self.process_examples(eval_dataset)
 
         predicted_answers = []
         for example in raw_eval_dataset:
@@ -250,6 +277,15 @@ class AcceleratedNLPTrainer():
         result = self.metric.compute(predictions=predicted_answers, references=theoretical_answers)
         return result
     
+    def process_examples(self, eval_dataset):
+        """
+        Process examples to map example IDs to feature indices.
+        """
+        example_to_features = collections.defaultdict(list)
+        for idx, feature in enumerate(eval_dataset):
+            example_to_features[feature["example_id"]].append(idx)
+        return example_to_features
+
     def handle_predictions_and_metric(self, outputs, batch, metric):
         if self.task_type == "token_classification":
             predictions = outputs.logits.argmax(-1)
@@ -388,9 +424,8 @@ class AcceleratedNLPSeq2SeqTrainer():
         self.datasets = {"train": train_dataset, "eval": eval_dataset}
         self.raw_dataset = raw_dataset
         self.tokenizer = tokenizer
-        specs = json.load(open(args_dir, 'r'))
-        self.specs = {**DEFAULT_SPECS, **specs}
         
+        self.setup_configuration(args_dir)
         self.prepare_with_accelerator(train_dataset, eval_dataset)
         self.prepare_scheduler()
 
@@ -398,6 +433,13 @@ class AcceleratedNLPSeq2SeqTrainer():
         self.task_type = task_type
         self.losses = []
         self.metric = evaluate.load(chosen_metric)
+
+    def setup_configuration(self, args_dir):
+        """
+        Set up configuration using the default specs and additional arguments.
+        """
+        specs = json.load(open(args_dir, 'r'))
+        self.specs = {**DEFAULT_SPECS, **specs}
 
     def prepare_with_accelerator(self, train_dataset, eval_dataset):
         #prepare data loader
@@ -411,12 +453,7 @@ class AcceleratedNLPSeq2SeqTrainer():
         )
 
     def prepare_data_loader(self, slice_type, dataset):
-        if slice_type == "train":
-            shuffle = True
-            batch_size = self.specs['per_device_train_batch_size']
-        else:
-            shuffle = False
-            batch_size = self.specs['per_device_eval_batch_size']
+        shuffle, batch_size = self.get_dataloader_params(slice_type)
         
         dataset.set_format('torch')
         self.dataloader = DataLoader(
@@ -428,14 +465,22 @@ class AcceleratedNLPSeq2SeqTrainer():
         
         return self.dataloader
     
+    def get_dataloader_params(self, slice_type):
+        """
+        Get DataLoader parameters based on slice type.
+        """
+        if slice_type == "train":
+            return True, self.specs['per_device_train_batch_size']
+        else:
+            return False, self.specs['per_device_eval_batch_size']
+    
     def prepare_scheduler(self):
         #Prepare scheduler specs
         self.scheduler_strategy = self.specs['scheduler_strategy']
         self.num_train_epochs = self.specs['num_train_epochs']
         self.num_warmup_steps = self.specs.get('num_warmup_steps', 0)
         
-        num_update_steps_per_epoch = len(self.train_dataloader)
-        self.num_training_steps = self.num_train_epochs * num_update_steps_per_epoch
+        self.calculate_training_steps()
 
         self.lr_scheduler = get_scheduler(
             self.scheduler_strategy,
@@ -444,15 +489,37 @@ class AcceleratedNLPSeq2SeqTrainer():
             num_training_steps=self.num_training_steps,
         )
     
+    def calculate_training_steps(self):
+        """
+        Calculate the number of training steps.
+        """
+        num_update_steps_per_epoch = len(self.train_dataloader)
+        self.num_training_steps = self.num_train_epochs * num_update_steps_per_epoch
+
     def save_and_upload(self, epoch):
+        # Split into save and upload methods
+        self.save_model(epoch)
+        self.upload_model(epoch)
+
+    def save_model(self, epoch):
+        """
+        Save the model to the specified directory.
+        """
         self.accelerator.wait_for_everyone()
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         unwrapped_model.save_pretrained(self.specs['output_dir'], save_function=self.accelerator.save)
+        if self.accelerator.is_main_process:
+            self.tokenizer.save_pretrained(self.specs['output_dir'])
+
+    def upload_model(self, epoch):
+        """
+        Upload the model to the hub.
+        """
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
         unwrapped_model.push_to_hub(
             commit_message=f"Training in progress epoch {epoch}", blocking=False
         )
         if self.accelerator.is_main_process:
-            self.tokenizer.save_pretrained(self.specs['output_dir'])
             self.tokenizer.push_to_hub(
                 commit_message=f"Training in progress epoch {epoch}", blocking=False
             )
@@ -476,9 +543,7 @@ class AcceleratedNLPSeq2SeqTrainer():
 
     def compute_qna_metrics(self, start_logits, end_logits, eval_dataset, raw_eval_dataset, chosen_metric, max_answer_length):
         self.metric = evaluate.load_metric(chosen_metric)
-        example_to_features = collections.defaultdict(list)
-        for idx, feature in enumerate(eval_dataset):
-            example_to_features[feature["example_id"]].append(idx)
+        example_to_features = self.process_examples(eval_dataset)
 
         predicted_answers = []
         for example in raw_eval_dataset:
@@ -524,6 +589,15 @@ class AcceleratedNLPSeq2SeqTrainer():
         result = self.metric.compute(predictions=predicted_answers, references=theoretical_answers)
         return result
     
+    def process_examples(self, eval_dataset):
+        """
+        Process examples to map example IDs to feature indices.
+        """
+        example_to_features = collections.defaultdict(list)
+        for idx, feature in enumerate(eval_dataset):
+            example_to_features[feature["example_id"]].append(idx)
+        return example_to_features
+
     def handle_predictions_and_metric(self, outputs, batch, metric):
         predictions = self.accelerator.unwrap_model(self.model).generate(
             batch["input_ids"],
