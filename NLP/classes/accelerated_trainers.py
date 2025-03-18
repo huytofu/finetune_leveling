@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 from transformers import get_scheduler
 from tqdm.auto import tqdm
 from configs.default_config import DEFAULT_SPECS
+from .config_manager import ConfigManager
+from .utils import Logger, ErrorHandler
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -86,8 +88,10 @@ class AcceleratedNLPTrainer():
             self.datasets = {"train": train_dataset, "eval": eval_dataset}
             self.raw_dataset = raw_dataset
             self.tokenizer = tokenizer
-            # Use parsed arguments
-            self.specs = vars(args)
+            
+            # Use ConfigManager for configuration
+            config_manager = ConfigManager()
+            self.specs = vars(config_manager.parse_args())
             
             self.prepare_with_accelerator(train_dataset, eval_dataset)
             self.prepare_scheduler()
@@ -96,10 +100,9 @@ class AcceleratedNLPTrainer():
             self.task_type = task_type
             self.losses = []
             self.metric = evaluate.load(chosen_metric)
-            logging.info("AcceleratedNLPTrainer initialized successfully.")
+            Logger.info("AcceleratedNLPTrainer initialized successfully.")
         except Exception as e:
-            logging.error(f"Error initializing AcceleratedNLPTrainer: {e}")
-            raise
+            ErrorHandler.handle_error(e, "AcceleratedNLPTrainer initialization")
 
     def prepare_with_accelerator(self, train_dataset, eval_dataset):
         """
