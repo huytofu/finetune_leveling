@@ -4,333 +4,342 @@ parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parentdir)
 
 import json
+import logging
+import torch
+from typing import Optional, Dict, Any, Union, List
 import evaluate
-import pytorch_lightning as pl
 from transformers import TrainingArguments, Trainer, Seq2SeqTrainer
 from configs.default_config import DEFAULT_SPECS
-from torch.utils.data import DataLoader
 
-class NLPTrainer(pl.LightningModule):
-    """
-    A PyTorch Lightning trainer class for NLP models.
-    
-    Attributes:
-        model: The model to be trained.
-        specs: Configuration specifications for training.
-        task_type: The type of task (e.g., classification, generation).
-        losses: A list to store training losses.
-    """
+logger = logging.getLogger(__name__)
+
+class NLPTrainer(Trainer):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
                 model_init=None, callbacks=None, scheduler=None, **kwargs):
-        """
-        Initialize the NLPTrainer.
-        
-        Args:
-            args_dir (str): Directory containing configuration arguments.
-            model: The model to be trained.
-            tokenizer: The tokenizer for text processing.
-            data_collator: The data collator for batching.
-            train_dataset: The training dataset.
-            eval_dataset: The evaluation dataset.
-            task_type (str): The type of task (e.g., classification, generation).
-            optimizer: The optimizer for training.
-            compute_metrics: Function to compute metrics during evaluation.
-            model_init: Function to initialize the model.
-            callbacks: List of callbacks to apply during training.
-            scheduler: Learning rate scheduler.
-            **kwargs: Additional keyword arguments.
-        """
-        super().__init__()
-        self.model = model
-        self.tokenizer = tokenizer
-        self.data_collator = data_collator
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
-        self.task_type = task_type
-        self.losses = []
 
-        # Load configuration specifications
         specs = json.load(open(args_dir, 'r'))
         self.specs = {**DEFAULT_SPECS, **specs}
 
-        # Store optimizer and scheduler
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+        # Set PEFT-specific training arguments
+        if self.specs.get('use_peft', False):
+            # Enable gradient checkpointing for memory efficiency with PEFT
+            self.specs['gradient_checkpointing'] = self.specs.get('use_gradient_checkpointing', True)
+            
+            # Add adapter dropout if using PEFT
+            if 'peft_method' in self.specs and self.specs['peft_method'] == 'lora':
+                self.specs['lora_dropout'] = self.specs.get('lora_dropout', 0.05)
+                
+            # Modify optimizer settings for PEFT
+            if not 'optim' in self.specs:
+                self.specs['optim'] = 'adamw_torch'
 
-    def forward(self, **inputs):
-        """
-        Forward pass through the model.
-        
-        Args:
-            **inputs: Input data for the model.
-        
-        Returns:
-            Model outputs.
-        """
-        return self.model(**inputs)
+        self.args = TrainingArguments(
+            **self.specs
+        )
 
-    def training_step(self, batch, batch_idx):
-        """
-        Perform a single training step.
-        
-        Args:
-            batch: The batch of data for the current step.
-            batch_idx: The index of the batch.
-        
-        Returns:
-            Loss from the current training step.
-        """
-        outputs = self.forward(**batch)
-        loss = outputs.loss
-        self.log('train_loss', loss)
-        return loss
+        self.datasets = {"train": train_dataset, "eval": eval_dataset}
+        self.task_type = task_type
+        self.losses = []
+        self.tokenizer = tokenizer
 
-    def validation_step(self, batch, batch_idx):
-        """
-        Perform a single validation step.
+        # Check if this is a PEFT model before initializing
+        self.is_peft_model = self._check_is_peft_model(model)
         
-        Args:
-            batch: The batch of data for the current step.
-            batch_idx: The index of the batch.
-        
-        Returns:
-            Validation loss.
-        """
-        outputs = self.forward(**batch)
-        val_loss = outputs.loss
-        self.log('val_loss', val_loss)
-        return val_loss
+        # Setup optimizers with PEFT awareness
+        if optimizer is None and self.is_peft_model:
+            # Only optimize trainable parameters for PEFT models
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=self.specs.get('learning_rate', 2e-5),
+                weight_decay=self.specs.get('weight_decay', 0.01),
+            )
+            logger.info(f"Created optimizer for PEFT model with {len(trainable_params)} trainable parameters")
 
-    def configure_optimizers(self):
-        """
-        Configure the optimizer and learning rate scheduler.
-        
-        Returns:
-            A dictionary containing the optimizer and scheduler.
-        """
-        return {'optimizer': self.optimizer, 'lr_scheduler': self.scheduler}
+        super().__init__(model, self.args, 
+                        data_collator=data_collator, 
+                        train_dataset=train_dataset, 
+                        eval_dataset=eval_dataset,
+                        tokenizer=tokenizer, 
+                        optimizers=[optimizer, scheduler] if optimizer else None,
+                        model_init=model_init, 
+                        compute_metrics=compute_metrics,
+                        callbacks=callbacks, **kwargs)
 
+    def _check_is_peft_model(self, model):
+        """Check if the model is a PEFT model"""
+        try:
+            from peft import PeftModel
+            is_peft = isinstance(model, PeftModel)
+            if is_peft:
+                logger.info(f"Detected PEFT model: {type(model).__name__}")
+                # Log trainable parameters for PEFT model
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                logger.info(f"Number of trainable parameters: {trainable_params}")
+            return is_peft
+        except ImportError:
+            logger.info("PEFT not installed, continuing with standard training")
+            return False
+
+    def train(self):
+        """Train the model, with special handling for PEFT models"""
+        if self.is_peft_model:
+            logger.info("Training PEFT model")
+            # Log PEFT-specific info before training
+            try:
+                peft_config = getattr(self.model, "peft_config", None)
+                if peft_config:
+                    logger.info(f"PEFT config: {peft_config}")
+                    
+                    # Add PEFT-specific memory optimizations
+                    if getattr(self.args, "gradient_checkpointing", False):
+                        logger.info("Enabling gradient checkpointing for PEFT model")
+                        self.model.gradient_checkpointing_enable()
+                        
+            except Exception as e:
+                logger.warning(f"Error configuring PEFT model: {e}")
+        
+        return super().train()
+    
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Save model with special handling for PEFT models"""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+
+        # Special handling for PEFT models
+        if self.is_peft_model:
+            try:
+                logger.info(f"Saving PEFT adapter to {output_dir}")
+                # Save only the adapter parameters
+                self.model.save_pretrained(output_dir)
+                
+                # Also save the tokenizer
+                if self.tokenizer is not None:
+                    self.tokenizer.save_pretrained(output_dir)
+                    
+                return output_dir
+            except Exception as e:
+                logger.error(f"Error saving PEFT model: {e}")
+                # Fall back to standard save
+        
+        # Standard save for non-PEFT models
+        return super().save_model(output_dir, _internal_call)
+    
+    def _get_train_sampler(self):
+        """Get train sampler with PEFT-specific adjustments if needed"""
+        sampler = super()._get_train_sampler()
+        
+        # For quantized PEFT models, we might need to adjust the sampler
+        if self.is_peft_model and hasattr(self.model, 'quantization_config'):
+            logger.info("Detected quantized PEFT model, checking sampler")
+            
+            # Check if we need to modify the batch size for quantized models
+            if self.args.per_device_train_batch_size > 4 and getattr(self.model, 'quantization_config', {}).get('quantization_type', None) in ['4bit', '8bit']:
+                logger.warning("Quantized PEFT model detected - consider reducing batch size if you encounter memory issues")
+                
+        return sampler
+    
     def print_args(self):
-        """
-        Print the training arguments.
-        """
-        print(self.specs)
+        print(self.args)
 
     def print_trainer_type(self):
-        """
-        Print the type of trainer.
-        """
-        print("I am an NLPTrainer!")
+        print("I am a NLPTrainer!")
+        if self.is_peft_model:
+            print("(with PEFT support)")
 
-    def train(self, max_epochs=10, gpus=1):
-        """
-        Train the model using PyTorch Lightning's Trainer.
-        
-        Args:
-            max_epochs (int): Maximum number of epochs to train.
-            gpus (int): Number of GPUs to use for training.
-        """
-        trainer = pl.Trainer(max_epochs=max_epochs, gpus=gpus)
-        trainer.fit(self, self.train_dataloader(), self.val_dataloader())
 
-    def train_dataloader(self):
-        """
-        Create the training data loader.
-        
-        Returns:
-            DataLoader: The training data loader.
-        """
-        return DataLoader(self.train_dataset, batch_size=self.specs['per_device_train_batch_size'], collate_fn=self.data_collator)
-
-    def val_dataloader(self):
-        """
-        Create the validation data loader.
-        
-        Returns:
-            DataLoader: The validation data loader.
-        """
-        return DataLoader(self.eval_dataset, batch_size=self.specs['per_device_eval_batch_size'], collate_fn=self.data_collator)
-
-class NLPSeq2SeqTrainer(pl.LightningModule):
-    """
-    A PyTorch Lightning trainer class for sequence-to-sequence NLP models.
-    
-    Attributes:
-        model: The model to be trained.
-        specs: Configuration specifications for training.
-        task_type: The type of task (e.g., translation, summarization).
-        losses: A list to store training losses.
-    """
+class NLPSeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, **kwargs):
-        """
-        Initialize the NLPSeq2SeqTrainer.
-        
-        Args:
-            args_dir (str): Directory containing configuration arguments.
-            model: The model to be trained.
-            tokenizer: The tokenizer for text processing.
-            data_collator: The data collator for batching.
-            train_dataset: The training dataset.
-            eval_dataset: The evaluation dataset.
-            task_type (str): The type of task (e.g., translation, summarization).
-            optimizer: The optimizer for training.
-            compute_metrics: Function to compute metrics during evaluation.
-            model_init: Function to initialize the model.
-            callbacks: List of callbacks to apply during training.
-            scheduler: Learning rate scheduler.
-            **kwargs: Additional keyword arguments.
-        """
-        super().__init__()
-        self.model = model
-        self.tokenizer = tokenizer
-        self.data_collator = data_collator
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
-        self.task_type = task_type
-        self.losses = []
+                model_init=None, callbacks=None, scheduler=None, 
+                generation_config=None, **kwargs):
 
-        # Load configuration specifications
         specs = json.load(open(args_dir, 'r'))
         self.specs = {**DEFAULT_SPECS, **specs}
 
-        # Store optimizer and scheduler
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+        # Set PEFT-specific training arguments for Seq2Seq
+        if self.specs.get('use_peft', False):
+            # Enable gradient checkpointing for memory efficiency with PEFT
+            self.specs['gradient_checkpointing'] = self.specs.get('use_gradient_checkpointing', True)
+            
+            # Add adapter dropout if using PEFT
+            if 'peft_method' in self.specs and self.specs['peft_method'] == 'lora':
+                self.specs['lora_dropout'] = self.specs.get('lora_dropout', 0.05)
+                
+            # Modify optimizer settings for PEFT
+            if not 'optim' in self.specs:
+                self.specs['optim'] = 'adamw_torch'
+                
+            # Ensure predict_with_generate is set for Seq2Seq PEFT models
+            self.specs['predict_with_generate'] = True
 
-        # Sequence generation parameters
-        self.max_length = self.specs.get('max_length', 128)
-        self.num_beams = self.specs.get('num_beams', 4)
-
-    def forward(self, **inputs):
-        """
-        Forward pass through the model.
-        
-        Args:
-            **inputs: Input data for the model.
-        
-        Returns:
-            Model outputs.
-        """
-        return self.model(**inputs)
-
-    def training_step(self, batch, batch_idx):
-        """
-        Perform a single training step.
-        
-        Args:
-            batch: The batch of data for the current step.
-            batch_idx: The index of the batch.
-        
-        Returns:
-            Loss from the current training step.
-        """
-        outputs = self.forward(**batch)
-        loss = outputs.loss
-        self.log('train_loss', loss)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        """
-        Perform a single validation step with sequence generation.
-        
-        Args:
-            batch: The batch of data for the current step.
-            batch_idx: The index of the batch.
-        
-        Returns:
-            Validation loss and generated sequences.
-        """
-        outputs = self.forward(**batch)
-        val_loss = outputs.loss
-        self.log('val_loss', val_loss)
-
-        # Generate sequences using beam search
-        generated_tokens = self.model.generate(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            max_length=self.max_length,
-            num_beams=self.num_beams
+        self.args = TrainingArguments(
+            **self.specs,
+            predict_with_generate=self.specs.get('predict_with_generate', True)
         )
 
-        # Decode generated tokens
-        decoded_preds = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-        decoded_labels = self.tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+        self.datasets = {"train": train_dataset, "eval": eval_dataset}
+        self.task_type = task_type
+        self.losses = []
+        self.tokenizer = tokenizer
+        self.generation_config = generation_config
 
-        # Compute metrics if provided
-        if self.compute_metrics:
-            self.compute_metrics(decoded_preds, decoded_labels)
-
-        return val_loss
-
-    def predict(self, batch):
-        """
-        Generate predictions for a batch of data.
+        # Check if this is a PEFT model before initializing
+        self.is_peft_model = self._check_is_peft_model(model)
         
-        Args:
-            batch: The batch of data for prediction.
+        # Setup optimizers with PEFT awareness
+        if optimizer is None and self.is_peft_model:
+            # Only optimize trainable parameters for PEFT models
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=self.specs.get('learning_rate', 2e-5),
+                weight_decay=self.specs.get('weight_decay', 0.01),
+            )
+            logger.info(f"Created optimizer for PEFT model with {len(trainable_params)} trainable parameters")
+
+        super().__init__(model, self.args, 
+                        data_collator=data_collator, 
+                        train_dataset=train_dataset, 
+                        eval_dataset=eval_dataset,
+                        tokenizer=tokenizer, 
+                        optimizers=[optimizer, scheduler] if optimizer else None,
+                        model_init=model_init, 
+                        compute_metrics=compute_metrics,
+                        callbacks=callbacks, **kwargs)
+
+    def _check_is_peft_model(self, model):
+        """Check if the model is a PEFT model"""
+        try:
+            from peft import PeftModel
+            is_peft = isinstance(model, PeftModel)
+            if is_peft:
+                logger.info(f"Detected PEFT model: {type(model).__name__}")
+                # Log trainable parameters for PEFT model
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                logger.info(f"Number of trainable parameters: {trainable_params}")
+            return is_peft
+        except ImportError:
+            logger.info("PEFT not installed, continuing with standard training")
+            return False
+
+    def train(self):
+        """Train the model, with special handling for PEFT models"""
+        if self.is_peft_model:
+            logger.info("Training PEFT Seq2Seq model")
+            # Log PEFT-specific info before training
+            try:
+                peft_config = getattr(self.model, "peft_config", None)
+                if peft_config:
+                    logger.info(f"PEFT config: {peft_config}")
+                    
+                    # Add PEFT-specific memory optimizations
+                    if getattr(self.args, "gradient_checkpointing", False):
+                        logger.info("Enabling gradient checkpointing for PEFT model")
+                        self.model.gradient_checkpointing_enable()
+                        
+            except Exception as e:
+                logger.warning(f"Error configuring PEFT model: {e}")
         
-        Returns:
-            Generated sequences.
+        return super().train()
+    
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Save model with special handling for PEFT models"""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+
+        # Special handling for PEFT models
+        if self.is_peft_model:
+            try:
+                logger.info(f"Saving PEFT adapter to {output_dir}")
+                # Save only the adapter parameters
+                self.model.save_pretrained(output_dir)
+                
+                # Also save the tokenizer
+                if self.tokenizer is not None:
+                    self.tokenizer.save_pretrained(output_dir)
+                    
+                # Save generation config if available
+                if self.generation_config is not None:
+                    self.generation_config.save_pretrained(output_dir)
+                    
+                return output_dir
+            except Exception as e:
+                logger.error(f"Error saving PEFT model: {e}")
+                # Fall back to standard save
+        
+        # Standard save for non-PEFT models
+        return super().save_model(output_dir, _internal_call)
+    
+    def _get_train_sampler(self):
+        """Get train sampler with PEFT-specific adjustments if needed"""
+        sampler = super()._get_train_sampler()
+        
+        # For quantized PEFT models, we might need to adjust the sampler
+        if self.is_peft_model and hasattr(self.model, 'quantization_config'):
+            logger.info("Detected quantized PEFT model, checking sampler")
+            
+            # Check if we need to modify the batch size for quantized models
+            if self.args.per_device_train_batch_size > 4 and getattr(self.model, 'quantization_config', {}).get('quantization_type', None) in ['4bit', '8bit']:
+                logger.warning("Quantized PEFT model detected - consider reducing batch size if you encounter memory issues")
+                
+        return sampler
+    
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
         """
-        generated_tokens = self.model.generate(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            max_length=self.max_length,
-            num_beams=self.num_beams
+        Override prediction_step to handle PEFT models with special generation parameters
+        """
+        if self.is_peft_model and not prediction_loss_only:
+            # For generation with PEFT models, we need special handling
+            try:
+                # Extract the generation kwargs from the model
+                generation_kwargs = {}
+                
+                # Set max length if not provided
+                if not hasattr(self.generation_config, "max_length") and not hasattr(self.generation_config, "max_new_tokens"):
+                    generation_kwargs["max_length"] = self.args.max_length
+                
+                # For LoRA in particular, some generation settings may need adjustment
+                peft_type = getattr(getattr(self.model, "peft_config", None), "peft_type", None)
+                if peft_type and "LORA" in str(peft_type):
+                    # LoRA models might need adjusted temperature/top_p for best generation
+                    if hasattr(self.generation_config, "temperature") and self.generation_config.temperature == 1.0:
+                        # Only adjust if user hasn't explicitly set these
+                        logger.info("Adjusting default temperature for LoRA generation")
+                        generation_kwargs["temperature"] = 0.7
+                
+                logger.debug(f"Using generation kwargs for PEFT model: {generation_kwargs}")
+                
+                # Pass these generation configs to the parent method
+                return super().prediction_step(
+                    model, 
+                    inputs, 
+                    prediction_loss_only,
+                    ignore_keys=ignore_keys,
+                    **generation_kwargs
+                )
+            except Exception as e:
+                logger.warning(f"Error in PEFT prediction_step, falling back to default: {e}")
+                
+        # For non-PEFT models or if PEFT handling fails, use default behavior
+        return super().prediction_step(
+            model, 
+            inputs, 
+            prediction_loss_only,
+            ignore_keys=ignore_keys,
         )
-        return self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-
-    def configure_optimizers(self):
-        """
-        Configure the optimizer and learning rate scheduler.
-        
-        Returns:
-            A dictionary containing the optimizer and scheduler.
-        """
-        return {'optimizer': self.optimizer, 'lr_scheduler': self.scheduler}
-
+    
     def print_args(self):
-        """
-        Print the training arguments.
-        """
-        print(self.specs)
+        print(self.args)
 
     def print_trainer_type(self):
-        """
-        Print the type of trainer.
-        """
-        print("I am an NLPSeq2SeqTrainer!")
-
-    def train(self, max_epochs=10, gpus=1):
-        """
-        Train the model using PyTorch Lightning's Trainer.
-        
-        Args:
-            max_epochs (int): Maximum number of epochs to train.
-            gpus (int): Number of GPUs to use for training.
-        """
-        trainer = pl.Trainer(max_epochs=max_epochs, gpus=gpus)
-        trainer.fit(self, self.train_dataloader(), self.val_dataloader())
-
-    def train_dataloader(self):
-        """
-        Create the training data loader.
-        
-        Returns:
-            DataLoader: The training data loader.
-        """
-        return DataLoader(self.train_dataset, batch_size=self.specs['per_device_train_batch_size'], collate_fn=self.data_collator)
-
-    def val_dataloader(self):
-        """
-        Create the validation data loader.
-        
-        Returns:
-            DataLoader: The validation data loader.
-        """
-        return DataLoader(self.eval_dataset, batch_size=self.specs['per_device_eval_batch_size'], collate_fn=self.data_collator)
+        print("I am a NLPSeq2SeqTrainer!")
+        if self.is_peft_model:
+            print("(with PEFT support)")
