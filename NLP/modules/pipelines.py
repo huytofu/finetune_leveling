@@ -6,16 +6,22 @@ import json
 import os
 import sys
 import torch
+from torch.optim import AdamW
+from transformers import (
+    pipeline,
+    DataCollatorForLanguageModeling,
+    DataCollatorForTokenClassification,
+    DataCollatorForSeq2Seq,
+    default_data_collator
+)
+
 currdir = os.path.dirname(os.path.abspath(__file__))
 parentdir = os.path.dirname(currdir)
 sys.path.append(currdir)
 sys.path.append(parentdir)
 
-
-from transformers import pipeline
 from model_modules import ModelModules
 from tokenizer_modules import TokenizerModules
-from pretrain_modules import PretrainModules
 from dataset_modules import DatasetModules
 from classes.accelerated_trainers import AcceleratedNLPTrainer, AcceleratedNLPSeq2SeqTrainer
 from classes.trainers import NLPTrainer, NLPSeq2SeqTrainer
@@ -310,76 +316,78 @@ class FineTunePipeLine():
         Initialize the fine-tuning pipeline.
         
         Args:
-            args_dir: Path to the arguments file
-            task_type: The type of task (e.g., 'masked_language_modeling', 'text_generation')
-            chosen_metric: The evaluation metric to use
-            quantization: Quantization settings
-            peft_method: Parameter-efficient fine-tuning method to use (None, "lora", "qlora", etc.)
-            peft_config: Configuration for the PEFT method
+            args_dir: Directory containing configuration arguments
+            task_type: Type of task (e.g., masked_language_modeling, token_classification)
+            chosen_metric: Metric to use for evaluation
+            quantization: Quantization configuration
+            peft_method: PEFT method to use
+            peft_config: PEFT configuration
             use_lightning: Whether to use PyTorch Lightning
-            use_accelerate: Whether to use Accelerate
+            use_accelerate: Whether to use Hugging Face Accelerate
         """
-        # Initialize args, task_type, and metrics
-        self.args_dir = args_dir
         self.task_type = task_type
+        self.specs = {**DEFAULT_SPECS}
+        if args_dir is not None:
+            self.specs.update(json.load(open(args_dir, 'r')))
+        
         self.chosen_metric = chosen_metric
         self.quantization = quantization
-        self.specs = {}
-        
-        # Initialize module helpers
-        self.model_modules = ModelModules()
-        self.dataset_modules = DatasetModules()
-        self.tokenizer_modules = TokenizerModules()
-        self.pretrain_modules = PretrainModules()
-        
-        # Initialize PEFT configuration
         self.peft_method = peft_method
-        self.peft_config = peft_config or {}
-        
-        # Set framework flags
+        self.peft_config = peft_config
         self.use_lightning = use_lightning
         self.use_accelerate = use_accelerate
         
-        # Initialize helper managers
-        self.checkpoint_manager = CheckpointManager()
-        self.quantization_manager = QuantizationManager()
-        self.type_utils = TypeUtils()
+        # Initialize managers and modules
+        self.checkpoint_manager = None
+        self.quantization_manager = None
+        self.model_modules = None
+        self.tokenizer_modules = None
+        self.dataset_modules = None
         
-        # Load specs
+        # Load specifications and initialize components
         self.load_specs()
+
+    def _prepare_fallback_optimizer(self, model):
+        """
+        Prepare a fallback optimizer in case the trainer doesn't have its own.
         
-        # Initialize the appropriate trainer class based on the task type and framework flags
-        if self.task_type in ["summarization", "translation", "text_generation"]:
-            if self.use_lightning:
-                if self.use_accelerate:
-                    from ..classes.accelerated_trainers_with_lightning import AcceleratedNLPSeq2SeqTrainer
-                    self.trainer_class = AcceleratedNLPSeq2SeqTrainer
-                else:
-                    from ..classes.trainers_with_lightning import NLPSeq2SeqTrainer
-                    self.trainer_class = NLPSeq2SeqTrainer
-            else:
-                if self.use_accelerate:
-                    from ..classes.accelerated_trainers import AcceleratedNLPSeq2SeqTrainer
-                    self.trainer_class = AcceleratedNLPSeq2SeqTrainer
-                else:
-                    from ..classes.trainers import NLPSeq2SeqTrainer
-                    self.trainer_class = NLPSeq2SeqTrainer
+        Args:
+            model: The model to optimize
+        
+        Returns:
+            The prepared optimizer
+        """
+        return AdamW(
+            model.parameters(),
+            lr=self.specs['learning_rate'],
+            weight_decay=self.specs['weight_decay']
+        )
+
+    def _prepare_fallback_data_collator(self, tokenizer, model=None):
+        """
+        Prepare a fallback data collator in case the trainer doesn't have its own.
+        
+        Args:
+            tokenizer: The tokenizer to use
+            model: The model (required for some collators)
+        
+        Returns:
+            The prepared data collator
+        """
+        if self.task_type == "masked_language_modeling":
+            return DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                mlm_probability=self.specs['mlm_probability']
+            )
+        elif self.task_type == "token_classification":
+            return DataCollatorForTokenClassification(tokenizer=tokenizer)
+        elif self.task_type in ["translation", "summarization", "text_generation"]:
+            return DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+        elif self.task_type == "question_answering":
+            return default_data_collator
         else:
-            if self.use_lightning:
-                if self.use_accelerate:
-                    from ..classes.accelerated_trainers_with_lightning import AcceleratedNLPTrainer
-                    self.trainer_class = AcceleratedNLPTrainer
-                else:
-                    from ..classes.trainers_with_lightning import NLPTrainer
-                    self.trainer_class = NLPTrainer
-            else:
-                if self.use_accelerate:
-                    from ..classes.accelerated_trainers import AcceleratedNLPTrainer
-                    self.trainer_class = AcceleratedNLPTrainer
-                else:
-                    from ..classes.trainers import NLPTrainer
-                    self.trainer_class = NLPTrainer
-    
+            raise ValueError(f"Unsupported task type: {self.task_type}")
+
     def load_specs(self):
         """Load specifications from the arguments file."""
         import json
@@ -390,7 +398,7 @@ class FineTunePipeLine():
         except Exception as e:
             print(f"Error loading specs: {e}")
             self.specs = DEFAULT_SPECS
-    
+
     def run(self):
         """Run the fine-tuning pipeline."""
         # Load model and tokenizer with appropriate quantization
@@ -439,25 +447,19 @@ class FineTunePipeLine():
         
         # Preprocess dataset based on task type
         if self.task_type == "masked_language_modeling":
-            train_dataset, eval_dataset, data_collator = self.pretrain_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
+            train_dataset, eval_dataset = self.dataset_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
         elif self.task_type == "token_classification":
-            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_token_classification(raw_dataset, tokenizer, self.specs)
+            train_dataset, eval_dataset = self.dataset_modules.prepare_token_classification(raw_dataset, tokenizer, self.specs)
         elif self.task_type == "translation":
-            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_translation(raw_dataset, tokenizer, self.specs)
+            train_dataset, eval_dataset = self.dataset_modules.prepare_translation(raw_dataset, tokenizer, self.specs)
         elif self.task_type == "summarization":
-            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_summarization(raw_dataset, tokenizer, self.specs)
+            train_dataset, eval_dataset = self.dataset_modules.prepare_summarization(raw_dataset, tokenizer, self.specs)
         elif self.task_type == "text_generation":
-            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_text_generation(raw_dataset, tokenizer, self.specs)
+            train_dataset, eval_dataset = self.dataset_modules.prepare_text_generation(raw_dataset, tokenizer, self.specs)
         elif self.task_type == "question_answering":
-            train_dataset, eval_dataset, data_collator = self.dataset_modules.prepare_question_answering(raw_dataset, tokenizer, self.specs)
+            train_dataset, eval_dataset = self.dataset_modules.prepare_question_answering(raw_dataset, tokenizer, self.specs)
         else:
-            train_dataset, eval_dataset, data_collator = None, None, None
-        
-        # Define optimizer
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=float(self.specs["learning_rate"])
-        )
+            train_dataset, eval_dataset = None, None
         
         # Setup additional callbacks for Lightning
         callbacks = []
@@ -480,18 +482,23 @@ class FineTunePipeLine():
                 )
                 callbacks.append(peft_pruning)
         
+        # Prepare fallback optimizer and data collator
+        fallback_optimizer = self._prepare_fallback_optimizer(model)
+        fallback_data_collator = self._prepare_fallback_data_collator(tokenizer, model)
+        
         # Initialize the trainer
         trainer_kwargs = {
             "args_dir": self.args_dir,
             "model": model,
             "tokenizer": tokenizer,
-            "data_collator": data_collator,
             "train_dataset": train_dataset,
             "eval_dataset": eval_dataset,
             "raw_dataset": raw_dataset,
             "task_type": self.task_type,
-            "optimizer": optimizer,
-            "chosen_metric": self.chosen_metric
+            "chosen_metric": self.chosen_metric,
+            "specs": self.specs,
+            "fallback_optimizer": fallback_optimizer,
+            "fallback_data_collator": fallback_data_collator
         }
         
         # Add callbacks for Lightning trainers
