@@ -19,8 +19,14 @@ from pretrain_modules import PretrainModules
 from dataset_modules import DatasetModules
 from classes.accelerated_trainers import AcceleratedNLPTrainer, AcceleratedNLPSeq2SeqTrainer
 from classes.trainers import NLPTrainer, NLPSeq2SeqTrainer
+from classes.accelerated_trainers_with_lightning import AcceleratedNLPTrainer as AcceleratedNLPTrainerWithLightning, AcceleratedNLPSeq2SeqTrainer as AcceleratedNLPSeq2SeqTrainerWithLightning
+from classes.trainers_with_lightning import NLPTrainer as NLPTrainerWithLightning, NLPSeq2SeqTrainer as NLPSeq2SeqTrainerWithLightning
 from configs.default_config import DEFAULT_SPECS
 from adapter_manager import MultiAdapterManager
+from ..classes.checkpoint_manager import CheckpointManager
+from ..classes.peft_callbacks import PeftAdapterMonitorCallback, PeftEarlyPruningCallback
+from ..classes.quantization_manager import QuantizationManager
+from ..classes.type_utils import TypeUtils
 
 class InferencePipeLine():
     def __init__(self, task_type, checkpoint, adapter_config=None):
@@ -297,56 +303,126 @@ class InferencePipeLine():
         return self.adapter_manager.list_adapters()[0]['id']
 
 class FineTunePipeLine():
-    def __init__(self, args_dir, task_type, checkpoint, dataset_name, 
-                dataset_config_name=None, text_column=None, summary_column=None, 
-                use_bert=False, use_accelerate=False, chosen_metric="accuracy",
-                peft_method=None, peft_config=None, quantization=None):
-        """Initialize the fine-tuning pipeline.
+    def __init__(self, args_dir, task_type,
+                chosen_metric=None, quantization=None,
+                peft_method=None, peft_config=None, use_lightning=False, use_accelerate=False):
+        """
+        Initialize the fine-tuning pipeline.
         
         Args:
-            args_dir: Path to the arguments directory
-            task_type: Type of task to fine-tune for
-            checkpoint: Model checkpoint to use
-            dataset_name: Name of the dataset to use
-            dataset_config_name: Configuration name for the dataset
-            text_column: Name of the text column in the dataset
-            summary_column: Name of the summary column in the dataset
-            use_bert: Whether to use BERT models
-            use_accelerate: Whether to use Accelerate for training
-            chosen_metric: Metric to use for evaluation
+            args_dir: Path to the arguments file
+            task_type: The type of task (e.g., 'masked_language_modeling', 'text_generation')
+            chosen_metric: The evaluation metric to use
+            quantization: Quantization settings
             peft_method: Parameter-efficient fine-tuning method to use (None, "lora", "qlora", etc.)
             peft_config: Configuration for the PEFT method
-            quantization: Quantization type to use (None, "4bit", "8bit")
+            use_lightning: Whether to use PyTorch Lightning
+            use_accelerate: Whether to use Accelerate
         """
+        # Initialize args, task_type, and metrics
         self.args_dir = args_dir
         self.task_type = task_type
-        self.checkpoint = checkpoint
-        self.dataset_name = dataset_name
-        self.dataset_config_name = dataset_config_name
-        self.text_column = text_column
-        self.summary_column = summary_column
-        self.use_bert = use_bert
-        self.use_accelerate = use_accelerate
         self.chosen_metric = chosen_metric
+        self.quantization = quantization
+        self.specs = {}
+        
+        # Initialize module helpers
+        self.model_modules = ModelModules()
+        self.dataset_modules = DatasetModules()
+        self.tokenizer_modules = TokenizerModules()
+        self.pretrain_modules = PretrainModules()
+        
+        # Initialize PEFT configuration
         self.peft_method = peft_method
         self.peft_config = peft_config or {}
-        self.quantization = quantization
         
-        specs = json.load(open(args_dir, 'r'))
-        self.specs = {**DEFAULT_SPECS, **specs}
+        # Set framework flags
+        self.use_lightning = use_lightning
+        self.use_accelerate = use_accelerate
         
-        self.model_modules = ModelModules(checkpoint, use_bert)
-        self.tokenizer_modules = TokenizerModules(checkpoint, use_bert)
-        self.pretrain_modules = PretrainModules(checkpoint, use_bert)
-        self.dataset_modules = DatasetModules(dataset_name, dataset_config_name, text_column, summary_column)
+        # Initialize helper managers
+        self.checkpoint_manager = CheckpointManager()
+        self.quantization_manager = QuantizationManager()
+        self.type_utils = TypeUtils()
         
+        # Load specs
+        self.load_specs()
+        
+        # Initialize the appropriate trainer class based on the task type and framework flags
+        if self.task_type in ["summarization", "translation", "text_generation"]:
+            if self.use_lightning:
+                if self.use_accelerate:
+                    from ..classes.accelerated_trainers_with_lightning import AcceleratedNLPSeq2SeqTrainer
+                    self.trainer_class = AcceleratedNLPSeq2SeqTrainer
+                else:
+                    from ..classes.trainers_with_lightning import NLPSeq2SeqTrainer
+                    self.trainer_class = NLPSeq2SeqTrainer
+            else:
+                if self.use_accelerate:
+                    from ..classes.accelerated_trainers import AcceleratedNLPSeq2SeqTrainer
+                    self.trainer_class = AcceleratedNLPSeq2SeqTrainer
+                else:
+                    from ..classes.trainers import NLPSeq2SeqTrainer
+                    self.trainer_class = NLPSeq2SeqTrainer
+        else:
+            if self.use_lightning:
+                if self.use_accelerate:
+                    from ..classes.accelerated_trainers_with_lightning import AcceleratedNLPTrainer
+                    self.trainer_class = AcceleratedNLPTrainer
+                else:
+                    from ..classes.trainers_with_lightning import NLPTrainer
+                    self.trainer_class = NLPTrainer
+            else:
+                if self.use_accelerate:
+                    from ..classes.accelerated_trainers import AcceleratedNLPTrainer
+                    self.trainer_class = AcceleratedNLPTrainer
+                else:
+                    from ..classes.trainers import NLPTrainer
+                    self.trainer_class = NLPTrainer
+    
+    def load_specs(self):
+        """Load specifications from the arguments file."""
+        import json
+        from configs.default_config import DEFAULT_SPECS
+        try:
+            specs = json.load(open(self.args_dir, 'r'))
+            self.specs = {**DEFAULT_SPECS, **specs}
+        except Exception as e:
+            print(f"Error loading specs: {e}")
+            self.specs = DEFAULT_SPECS
+    
     def run(self):
-        # Load model and tokenizer
-        model = self.model_modules.load_model(self.task_type, self.quantization)
+        """Run the fine-tuning pipeline."""
+        # Load model and tokenizer with appropriate quantization
+        model_kwargs = {}
+        if self.quantization:
+            model_kwargs = self.quantization_manager.prepare_model_for_quantization(
+                model_name_or_path=self.specs.get("model_name_or_path", ""),
+                quant_type=self.quantization,
+                custom_quantization_config=self.specs.get("quantization_config", None)
+            )
+            
+        model = self.model_modules.load_model(self.task_type, model_kwargs)
         tokenizer = self.tokenizer_modules.load_tokenizer()
+        
+        # Optimize memory layout
+        model = self.type_utils.optimize_memory_layout(model, self.peft_method)
         
         # Apply PEFT if specified
         if self.peft_method:
+            # Check compatibility with quantization
+            if self.quantization:
+                is_compatible, reason = self.quantization_manager.check_peft_compatible(
+                    model, self.peft_method
+                )
+                if not is_compatible:
+                    print(f"Warning: {reason}")
+                
+                # Optimize for PEFT with quantization
+                model = self.quantization_manager.optimize_model_for_peft(
+                    model, self.quantization, self.peft_method
+                )
+                
             model, tokenizer = self.model_modules.apply_peft(
                 model=model,
                 tokenizer=tokenizer,
@@ -354,11 +430,14 @@ class FineTunePipeLine():
                 peft_config=self.peft_config,
                 task_type=self.task_type
             )
+            
+            # Validate parameter types
+            self.type_utils.check_parameter_types(model)
         
         # Load dataset
         raw_dataset = self.dataset_modules.load_dataset()
         
-        # Preprocess dataset
+        # Preprocess dataset based on task type
         if self.task_type == "masked_language_modeling":
             train_dataset, eval_dataset, data_collator = self.pretrain_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
         elif self.task_type == "token_classification":
@@ -375,51 +454,116 @@ class FineTunePipeLine():
             train_dataset, eval_dataset, data_collator = None, None, None
         
         # Define optimizer
-        optimizer = torch.optim.AdamW(model.parameters(), lr=float(self.specs["learning_rate"]))
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=float(self.specs["learning_rate"])
+        )
         
-        # Train model
-        if self.use_accelerate:
-            if self.task_type == "translation" or self.task_type == "summarization" or self.task_type == "text_generation":
-                trainer = AcceleratedNLPSeq2SeqTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, raw_dataset,
-                    self.task_type, optimizer, self.chosen_metric
+        # Setup additional callbacks for Lightning
+        callbacks = []
+        if self.use_lightning and self.peft_method:
+            # Add PEFT-specific callbacks
+            peft_monitor = PeftAdapterMonitorCallback(
+                monitor_gradients=True,
+                monitor_weights=True,
+                log_every_n_steps=100,
+                save_path=os.path.join(self.specs["output_dir"], "peft_monitoring")
+            )
+            callbacks.append(peft_monitor)
+            
+            # Only add pruning if enabled in specs
+            if self.specs.get("peft_pruning_enabled", False):
+                peft_pruning = PeftEarlyPruningCallback(
+                    start_pruning_epoch=1,
+                    pruning_threshold=self.specs.get("peft_pruning_threshold", 0.01),
+                    final_sparsity=self.specs.get("peft_pruning_sparsity", 0.3)
                 )
-            else:
-                trainer = AcceleratedNLPTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, raw_dataset,
-                    self.task_type, optimizer, self.chosen_metric
-                )
+                callbacks.append(peft_pruning)
+        
+        # Initialize the trainer
+        trainer_kwargs = {
+            "args_dir": self.args_dir,
+            "model": model,
+            "tokenizer": tokenizer,
+            "data_collator": data_collator,
+            "train_dataset": train_dataset,
+            "eval_dataset": eval_dataset,
+            "raw_dataset": raw_dataset,
+            "task_type": self.task_type,
+            "optimizer": optimizer,
+            "chosen_metric": self.chosen_metric
+        }
+        
+        # Add callbacks for Lightning trainers
+        if self.use_lightning and callbacks:
+            trainer_kwargs["callbacks"] = callbacks
+        
+        trainer = self.trainer_class(**trainer_kwargs)
+        
+        # Run the training process
+        if self.use_lightning:
+            trainer.fit()
         else:
-            if self.task_type == "translation" or self.task_type == "summarization" or self.task_type == "text_generation":
-                trainer = NLPSeq2SeqTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, 
-                    self.task_type, optimizer
-                )
-            else:
-                trainer = NLPTrainer(
-                    self.args_dir, model, tokenizer, 
-                    data_collator, train_dataset, eval_dataset, 
-                    self.task_type, optimizer
-                )
+            trainer.train()
         
-        # Train model
-        trainer.train()
-        
-        # Save model
-        if self.peft_method:
-            # For PEFT models, we need to save the adapter separately
-            from .peft_modules import PEFTModules
-            peft_modules = PEFTModules()
-            peft_modules.save_peft_model(model, self.specs["output_dir"])
-        else:
-            # For regular models, we can use the trainer to save
-            trainer.model.save_pretrained(self.specs["output_dir"])
-            tokenizer.save_pretrained(self.specs["output_dir"])
+        # Save model and checkpoint
+        self.save_model_and_checkpoint(model, tokenizer, trainer)
         
         return model, tokenizer
+    
+    def save_model_and_checkpoint(self, model, tokenizer, trainer):
+        """Save the model, tokenizer, and create a checkpoint."""
+        output_dir = self.specs["output_dir"]
+        
+        # For PEFT models, use different saving approach
+        if self.peft_method:
+            # Save using the checkpoint manager
+            self.checkpoint_manager.save_checkpoint(
+                model=model,
+                tokenizer=tokenizer,
+                output_dir=output_dir,
+                epoch=self.specs.get("num_train_epochs", 3),
+                is_best=True
+            )
+        else:
+            # For regular models, we can use the trainer to save
+            if hasattr(trainer, "save_model"):
+                trainer.save_model(output_dir)
+            elif hasattr(model, "save_pretrained"):
+                model.save_pretrained(output_dir)
+                tokenizer.save_pretrained(output_dir)
+            else:
+                # Fallback for other model types
+                torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+                tokenizer.save_pretrained(output_dir)
+    
+    def load_checkpoint(self, checkpoint_dir, convert_precision=None):
+        """
+        Load a checkpoint using the checkpoint manager.
+        
+        Args:
+            checkpoint_dir: Directory containing the checkpoint
+            convert_precision: Optional precision to convert to (fp16, bf16, fp32)
+            
+        Returns:
+            Tuple of (loaded_model, loaded_tokenizer)
+        """
+        # Load specs for model initialization
+        self.load_specs()
+        
+        # Load base model
+        model = self.model_modules.load_model(self.task_type)
+        tokenizer = self.tokenizer_modules.load_tokenizer()
+        
+        # Load checkpoint
+        model, tokenizer, meta = self.checkpoint_manager.load_checkpoint(
+            model=model,
+            tokenizer=tokenizer,
+            checkpoint_dir=checkpoint_dir,
+            target_precision=convert_precision
+        )
+        
+        return model, tokenizer, meta
 
     def postprocess(self, predictions, labels):
         predictions = predictions.detach().cpu().clone().numpy()
