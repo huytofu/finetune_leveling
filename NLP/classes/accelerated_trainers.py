@@ -13,11 +13,12 @@ import logging
 import configargparse
 from typing import Optional, Dict, Any, Union, List
 from dataclasses import dataclass
+import random
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
-from transformers import get_scheduler
+from transformers import get_scheduler, GenerationConfig
 from tqdm.auto import tqdm
 from configs.default_config import DEFAULT_SPECS
 from .config_manager import ConfigManager
@@ -622,41 +623,92 @@ class AcceleratedNLPTrainer():
 
 
 class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
-    def __init__(self, args_dir, model, tokenizer, 
-                data_collator, train_dataset, eval_dataset, raw_dataset,
-                task_type, optimizer, chosen_metric):
-        super().__init__(args_dir, model, tokenizer, 
-                        data_collator, train_dataset, eval_dataset, raw_dataset,
-                        task_type, optimizer, chosen_metric)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setup_seq2seq_config()
         
-        # Additional Seq2Seq specific setup
-        self.setup_generation_config()
+    def setup_seq2seq_config(self):
+        """Setup specialized configuration for seq2seq training"""
+        self.teacher_forcing_ratio = self.specs.get('teacher_forcing_ratio', 0.5)
+        self.use_selective_activation_cache = self.specs.get('use_selective_activation_cache', True)
         
-    def setup_generation_config(self):
-        """Setup generation configuration with PEFT awareness"""
-        from transformers import GenerationConfig
-        
+        # Setup generation config with memory optimization
         self.generation_config = GenerationConfig(
             max_length=self.specs.get('max_length', 128),
             num_beams=self.specs.get('num_beams', 4),
-            do_sample=self.specs.get('do_sample', False),
-            temperature=self.specs.get('temperature', 1.0),
-            top_p=self.specs.get('top_p', 1.0),
-            top_k=self.specs.get('top_k', 50),
+            length_penalty=self.specs.get('length_penalty', 1.0),
+            early_stopping=True,
+            use_cache=not self.is_peft_model,  # Disable KV cache for PEFT models
         )
+
+    def _prepare_inputs(self, inputs):
+        """Enhanced input preparation with specialized attention patterns"""
+        prepared_inputs = super()._prepare_inputs(inputs)
         
-        if self.is_peft_model:
-            # Adjust generation parameters based on PEFT type
-            if self.peft_config.peft_type == "LORA":
-                # LoRA models might need different generation settings
-                self.generation_config.temperature = 0.7
-                self.generation_config.top_p = 0.9
-            elif "PREFIX" in self.peft_config.peft_type:
-                # Prefix tuning might need different settings
-                self.generation_config.num_beams = max(2, self.generation_config.num_beams - 1)
+        # Handle attention masks differently for encoder and decoder
+        if 'attention_mask' in prepared_inputs:
+            encoder_attention_mask = prepared_inputs['attention_mask']
+            # Create causal mask for decoder
+            decoder_attention_mask = self._create_causal_mask(
+                prepared_inputs.get('decoder_input_ids', None)
+            )
+            
+            prepared_inputs['encoder_attention_mask'] = encoder_attention_mask
+            prepared_inputs['decoder_attention_mask'] = decoder_attention_mask
+            
+        return prepared_inputs
+
+    def _create_causal_mask(self, input_ids):
+        """Create causal attention mask for decoder"""
+        if input_ids is None:
+            return None
+            
+        batch_size, seq_length = input_ids.shape
+        mask = torch.triu(
+            torch.ones((seq_length, seq_length), dtype=torch.bool, device=self.accelerator.device),
+            diagonal=1
+        )
+        mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+        return mask
+
+    def _setup_gradient_checkpointing(self):
+        """Enhanced gradient checkpointing for seq2seq models"""
+        if not self.specs.get('use_gradient_checkpointing', False):
+            return
+            
+        # Enable gradient checkpointing
+        if hasattr(self.model, 'encoder'):
+            self.model.encoder.gradient_checkpointing_enable()
+        if hasattr(self.model, 'decoder'):
+            self.model.decoder.gradient_checkpointing_enable()
+        
+        # Selective activation caching
+        if self.use_selective_activation_cache:
+            if hasattr(self.model.encoder, "enable_selective_activation_cache"):
+                self.model.encoder.enable_selective_activation_cache()
+            if hasattr(self.model.decoder, "enable_selective_activation_cache"):
+                self.model.decoder.enable_selective_activation_cache()
+
+    def _optimize_beam_search(self):
+        """Memory-efficient beam search implementation"""
+        kwargs = {}
+        
+        if not self.is_peft_model:
+            return kwargs
+            
+        # Optimize memory usage for PEFT models during beam search
+        kwargs['use_cache'] = False  # Disable KV cache
+        
+        # Adjust beam size based on available memory
+        if self.specs.get('num_beams', 4) > 4 and torch.cuda.is_available():
+            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+            if free_memory < 4 * 1024 * 1024 * 1024:  # Less than 4GB free
+                kwargs['num_beams'] = min(self.specs.get('num_beams', 4), 4)
                 
-    def _handle_seq2seq_gradients(self, loss, step):
-        """Handle gradients specifically for Seq2Seq PEFT models with Accelerator integration"""
+        return kwargs
+
+    def _handle_seq2seq_gradients(self, loss):
+        """Handle gradients specifically for Seq2Seq PEFT models"""
         if not self.is_peft_model:
             return loss
 
@@ -670,23 +722,9 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
                 # Different scaling for Seq2Seq prefix tuning
                 loss = loss * 1.1
 
-        # Scale loss for gradient accumulation
+        # Scale loss for gradient accumulation if needed
         if self.specs.get('gradient_accumulation_steps', 1) > 1:
             loss = loss / self.specs['gradient_accumulation_steps']
-
-        # Backward pass with Accelerator
-        self.accelerator.backward(loss)
-
-        # Apply gradient clipping on accumulation step
-        if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
-            if self.specs.get('max_grad_norm', 1.0) > 0:
-                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-                # More conservative clipping for Seq2Seq models
-                max_grad_norm = self.specs.get('max_grad_norm', 1.0) * 0.9
-                self.accelerator.clip_grad_norm_(trainable_params, max_grad_norm)
-
-            # Scale gradients with Seq2Seq specific handling
-            self._scale_seq2seq_gradients()
 
         return loss
 
@@ -722,153 +760,144 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             for param in decoder_params:
                 param.grad.data = param.grad.data * 1.1
 
-    def _train_step(self, batch, step):
-        """Enhanced Seq2Seq training step with PEFT-aware gradient handling"""
+    def _train_step(self, step, batch):
+        """Enhanced training step with specialized seq2seq handling"""
         try:
-            # Forward pass with Accelerator's autocast
+            # Setup gradient checkpointing
+            self._setup_gradient_checkpointing()
+            
+            # Prepare inputs with attention patterns
+            inputs = self._prepare_inputs(batch)
+            
+            # Forward pass with teacher forcing
             with self.accelerator.autocast():
-                outputs = self.model(**batch)
-                loss = outputs.loss
-
-            # Handle gradients with Seq2Seq specific handling
-            loss = self._handle_seq2seq_gradients(loss, step)
-
-            # Update on accumulation step
-            if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                
-                if self.specs.get('gradient_accumulation_steps', 1) > 1:
-                    loss = loss / self.specs['gradient_accumulation_steps']
-                
+                if random.random() < self.teacher_forcing_ratio:
+                    outputs = self.model(**inputs)
+                else:
+                    with torch.no_grad():
+                        generated = self.model.generate(
+                            inputs['input_ids'],
+                            attention_mask=inputs.get('attention_mask'),
+                            **self._optimize_beam_search()
+                        )
+                    outputs = self.model(**inputs, decoder_input_ids=generated)
+            
+            loss = outputs.loss
+            
+            # Handle gradients
+            loss = self._handle_seq2seq_gradients(loss)
+            
+            # Scale loss for gradient accumulation
+            if self.specs.get('gradient_accumulation_steps', 1) > 1:
+                loss = loss / self.specs['gradient_accumulation_steps']
+            
+            # Backward pass
             self.accelerator.backward(loss)
             
-            if self.is_peft_model:
-                # Memory optimization for PEFT sequence models
-                if hasattr(self.model, "active_adapter"):
-                    # Free memory of inactive adapters during backward pass
-                    current_adapter = self.model.active_adapter
-                    for adapter in self.model.peft_config:
-                        if adapter != current_adapter:
-                            self.model.disable_adapter_layers(adapter)
-                
-                # Apply gradient clipping based on PEFT type
-                clip_norm = self.specs.get('max_grad_norm', 1.0)
-                if "PREFIX" in self.peft_config.peft_type:
-                    clip_norm = clip_norm / 2  # More conservative for prefix tuning
-                
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
-                    clip_norm
-                )
+            # Scale gradients
+            self._scale_seq2seq_gradients()
             
-            if not self.accelerator.step_was_skipped:
-                self.optimizer.step()
-                self.lr_scheduler.step()
-            
-            self.optimizer.zero_grad()
+            # Log metrics
+            if self.specs.get('debug_gradients', False):
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params if p.grad is not None]))
+                self.log({'gradient_norm': grad_norm})
             
             return loss.item()
-
+            
         except Exception as e:
-            ErrorHandler.handle_error(e, f"Seq2Seq training step {step}")
-            return None
+            Logger.error(f"Error in Seq2Seq training step {step}: {e}")
+            raise e
+
+    def _eval_step(self, batch):
+        """Enhanced evaluation step with memory optimizations"""
+        inputs = self._prepare_inputs(batch)
         
-    def generate(self, batch):
-        """Generate sequences with PEFT-aware handling"""
-        if self.is_peft_model:
-            # Special handling for PEFT models during generation
-            try:
-                generation_kwargs = self.generation_config.to_dict()
-                
-                # Adjust settings based on PEFT type
-                if self.peft_config.peft_type == "LORA":
-                    # LoRA-specific generation optimizations
-                    generation_kwargs["max_new_tokens"] = min(
-                        generation_kwargs.get("max_length", 128),
-                        self.specs.get("max_new_tokens", 64)
-                    )
-                elif "PREFIX" in self.peft_config.peft_type:
-                    # Prefix tuning specific adjustments
-                    generation_kwargs["length_penalty"] = 0.8
-                    
-                return self.model.generate(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    **generation_kwargs
+        generation_kwargs = self._optimize_beam_search()
+        
+        # Generate with optimized memory usage
+        with torch.no_grad():
+            with self.accelerator.autocast():
+                generated_tokens = self.model.generate(
+                    inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    **generation_kwargs,
                 )
-            except Exception as e:
-                Logger.warning(f"Error in PEFT generation, falling back to default: {e}")
                 
-        # Default generation for non-PEFT models
-        return self.model.generate(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            max_length=self.specs.get("max_length", 128)
-        )
+                # Compute loss
+                outputs = self.model(**inputs)
+                loss = outputs.loss
         
-    def prepare_with_accelerator(self, train_dataset, eval_dataset):
-        """Enhanced accelerator preparation for Seq2Seq PEFT models"""
-        super().prepare_with_accelerator(train_dataset, eval_dataset)
+        return {
+            'loss': loss.item(),
+            'generated': generated_tokens,
+            'labels': inputs.get('labels')
+        }
+
+    def save_model(self, output_dir: str = None):
+        """Enhanced model saving with seq2seq state management"""
+        output_dir = output_dir or self.specs.get('output_dir', 'model')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the model
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        
+        # Save PEFT-specific states
+        if self.is_peft_model:
+            # Save encoder and decoder states separately
+            if hasattr(unwrapped_model, 'encoder'):
+                encoder_state = unwrapped_model.encoder.state_dict()
+                torch.save(encoder_state, os.path.join(output_dir, 'encoder_state.bin'))
+            if hasattr(unwrapped_model, 'decoder'):
+                decoder_state = unwrapped_model.decoder.state_dict()
+                torch.save(decoder_state, os.path.join(output_dir, 'decoder_state.bin'))
+            
+            # Save generation config
+            if hasattr(self, 'generation_config'):
+                self.generation_config.save_pretrained(output_dir)
+            
+            # Save memory optimization settings
+            memory_config = {
+                'use_selective_activation_cache': self.use_selective_activation_cache,
+                'teacher_forcing_ratio': self.teacher_forcing_ratio
+            }
+            with open(os.path.join(output_dir, 'memory_config.json'), 'w') as f:
+                json.dump(memory_config, f)
+        
+        # Save the full model
+        unwrapped_model.save_pretrained(output_dir)
+        
+        Logger.info(f"Model saved to {output_dir}")
+
+    def load_model(self, model_path: str):
+        """Enhanced model loading with seq2seq state management"""
+        # Load the base model
+        super().load_model(model_path)
         
         if self.is_peft_model:
-            # Additional memory optimizations for Seq2Seq PEFT models
-            if hasattr(self.model, "gradient_checkpointing_enable"):
-                self.model.gradient_checkpointing_enable()
-                Logger.info("Enabled gradient checkpointing for PEFT Seq2Seq model")
+            # Load encoder and decoder states
+            encoder_path = os.path.join(model_path, 'encoder_state.bin')
+            if os.path.exists(encoder_path) and hasattr(self.model, 'encoder'):
+                encoder_state = torch.load(encoder_path, map_location=self.accelerator.device)
+                self.model.encoder.load_state_dict(encoder_state)
                 
-            # Configure model for efficient generation
-            if hasattr(self.model, "config"):
-                self.model.config.use_cache = False  # Better memory efficiency
-                
-            # Set up memory efficient attention if available
-            try:
-                from transformers.utils import is_flash_attn_available
-                if is_flash_attn_available():
-                    self.model.enable_flash_attention()
-                    Logger.info("Enabled flash attention for PEFT Seq2Seq model")
-            except ImportError:
-                pass
-
-    def postprocess(self, predictions, labels):
-        """Seq2Seq specific postprocessing of predictions and labels"""
-        predictions = predictions.detach().cpu().clone().numpy()
-        labels = labels.detach().cpu().clone().numpy()
-        
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-
-        # Remove ignored index (special tokens) and convert to labels
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        true_predictions = [pred.strip() for pred in decoded_preds]
-        true_labels = [label.strip() for label in decoded_labels]
-
-        return true_labels, true_predictions
-
-    def handle_predictions_and_metric(self, outputs, batch, metric):
-        """Seq2Seq specific prediction and metric handling"""
-        predictions = self.generate(batch)
-        labels = batch["labels"]
-        
-        # Handle distributed training
-        predictions = self.accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
-        labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-        predictions = self.accelerator.gather(predictions)
-        labels = self.accelerator.gather(labels)
-        
-        # Process predictions and labels
-        true_predictions, true_labels = self.postprocess(predictions, labels)
-        metric.add_batch(predictions=true_predictions, references=true_labels)
-
-    def handle_outputs(self, outputs, batch, batch_size, losses, metric):
-        """Seq2Seq specific output handling"""
-        loss = outputs.loss
-        self.accelerator.log({"loss": loss.item()})
-        losses.append(self.accelerator.gather(loss.repeat(batch_size)))
-        self.handle_predictions_and_metric(outputs, batch, metric)
+            decoder_path = os.path.join(model_path, 'decoder_state.bin')
+            if os.path.exists(decoder_path) and hasattr(self.model, 'decoder'):
+                decoder_state = torch.load(decoder_path, map_location=self.accelerator.device)
+                self.model.decoder.load_state_dict(decoder_state)
+            
+            # Load generation config
+            generation_config_path = os.path.join(model_path, 'generation_config.json')
+            if os.path.exists(generation_config_path):
+                self.generation_config = GenerationConfig.from_pretrained(model_path)
+            
+            # Load memory optimization settings
+            memory_config_path = os.path.join(model_path, 'memory_config.json')
+            if os.path.exists(memory_config_path):
+                with open(memory_config_path, 'r') as f:
+                    memory_config = json.load(f)
+                self.use_selective_activation_cache = memory_config['use_selective_activation_cache']
+                self.teacher_forcing_ratio = memory_config['teacher_forcing_ratio']
 
     def print_trainer_type(self):
         print("I am an AcceleratedNLPSeq2SeqTrainer!")
