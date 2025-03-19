@@ -1,8 +1,17 @@
-from transformers import BertForMaskedLM, BertForTokenClassification
-from transformers import AutoModelForMaskedLM, AutoModelForTokenClassification, AutoModelForSeq2SeqLM, AutoModelForQuestionAnswering
-from transformers import BitsAndBytesConfig
+# Standard library imports
+from typing import Dict, List, Optional, Union
+
+# Third-party imports
 import torch
-from typing import Dict, Optional, Union, List
+from transformers import (
+    AutoModelForMaskedLM,
+    AutoModelForQuestionAnswering,
+    AutoModelForSeq2SeqLM,
+    AutoModelForTokenClassification,
+    BertForMaskedLM,
+    BertForTokenClassification,
+    BitsAndBytesConfig
+)
 
 class ModelModules():
     """

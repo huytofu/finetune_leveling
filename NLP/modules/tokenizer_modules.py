@@ -1,4 +1,5 @@
-from transformers import BertTokenizer, AutoTokenizer
+# Third-party imports
+from transformers import AutoTokenizer, BertTokenizer
 
 class TokenizerModules():
     def __init__(self, checkpoint, use_bert=False):

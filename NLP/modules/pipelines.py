@@ -1,41 +1,135 @@
-import numpy as np
-import evaluate
-import nltk
+# Standard library imports
 import collections
 import json
+import logging
 import os
 import sys
+import time
+from datetime import datetime
+from typing import Dict, Any
+
+# Third-party imports
+import evaluate
+import mlflow
+import nltk
+import numpy as np
+import psutil
 import torch
 from torch.optim import AdamW
 from transformers import (
-    pipeline,
     DataCollatorForLanguageModeling,
-    DataCollatorForTokenClassification,
     DataCollatorForSeq2Seq,
-    default_data_collator
+    DataCollatorForTokenClassification,
+    default_data_collator,
+    pipeline
 )
 import time
 import mlflow
 from datetime import datetime
 
+# Local imports
 currdir = os.path.dirname(os.path.abspath(__file__))
 parentdir = os.path.dirname(currdir)
 sys.path.append(currdir)
 sys.path.append(parentdir)
 
+from adapter_manager import MultiAdapterManager
+from classes.accelerated_trainers import (
+    AcceleratedNLPTrainer,
+    AcceleratedNLPSeq2SeqTrainer
+)
+from classes.accelerated_trainers_with_lightning import (
+    AcceleratedNLPTrainer as AcceleratedNLPTrainerWithLightning,
+    AcceleratedNLPSeq2SeqTrainer as AcceleratedNLPSeq2SeqTrainerWithLightning
+)
+from classes.checkpoint_manager import CheckpointManager
+from classes.peft_callbacks import (
+    PeftAdapterMonitorCallback,
+    PeftEarlyPruningCallback
+)
+from classes.quantization_manager import QuantizationManager
+from classes.trainers import (
+    NLPTrainer,
+    NLPSeq2SeqTrainer
+)
+from classes.trainers_with_lightning import (
+    NLPTrainer as NLPTrainerWithLightning,
+    NLPSeq2SeqTrainer as NLPSeq2SeqTrainerWithLightning
+)
+from classes.type_utils import TypeUtils
+from configs.default_config import DEFAULT_SPECS
+from dataset_modules import DatasetModules
 from model_modules import ModelModules
 from tokenizer_modules import TokenizerModules
-from dataset_modules import DatasetModules
-from classes.accelerated_trainers import AcceleratedNLPTrainer, AcceleratedNLPSeq2SeqTrainer
-from classes.trainers import NLPTrainer, NLPSeq2SeqTrainer
-from classes.accelerated_trainers_with_lightning import AcceleratedNLPTrainer as AcceleratedNLPTrainerWithLightning, AcceleratedNLPSeq2SeqTrainer as AcceleratedNLPSeq2SeqTrainerWithLightning
-from classes.trainers_with_lightning import NLPTrainer as NLPTrainerWithLightning, NLPSeq2SeqTrainer as NLPSeq2SeqTrainerWithLightning
-from configs.default_config import DEFAULT_SPECS
-from adapter_manager import MultiAdapterManager
-from ..classes.checkpoint_manager import CheckpointManager
-from ..classes.peft_callbacks import PeftAdapterMonitorCallback, PeftEarlyPruningCallback
-from ..classes.quantization_manager import QuantizationManager
-from ..classes.type_utils import TypeUtils
+
+class MLflowCallback:
+    """Callback for tracking training metrics in MLflow."""
+    
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.epoch_start_time = None
+        self.step_start_time = None
+        
+    def on_train_begin(self, args, state, control):
+        """Called when training begins."""
+        self.epoch_start_time = time.time()
+        mlflow.log_param("train_batch_size", args.per_device_train_batch_size)
+        mlflow.log_param("eval_batch_size", args.per_device_eval_batch_size)
+        mlflow.log_param("learning_rate", args.learning_rate)
+        mlflow.log_param("num_train_epochs", args.num_train_epochs)
+        mlflow.log_param("warmup_steps", args.warmup_steps)
+        mlflow.log_param("weight_decay", args.weight_decay)
+        mlflow.log_param("gradient_accumulation_steps", args.gradient_accumulation_steps)
+        mlflow.log_param("max_grad_norm", args.max_grad_norm)
+        
+    def on_epoch_begin(self, args, state, control):
+        """Called when an epoch begins."""
+        self.epoch_start_time = time.time()
+        mlflow.log_param(f"epoch_{state.epoch}", state.epoch)
+        
+    def on_epoch_end(self, args, state, control):
+        """Called when an epoch ends."""
+        epoch_duration = time.time() - self.epoch_start_time
+        mlflow.log_metric(f"epoch_{state.epoch}_duration", epoch_duration)
+        
+        # Log resource usage at epoch end
+        mlflow.log_metric(f"epoch_{state.epoch}_cpu_percent", psutil.cpu_percent())
+        mlflow.log_metric(f"epoch_{state.epoch}_memory_percent", psutil.virtual_memory().percent)
+        if torch.cuda.is_available():
+            mlflow.log_metric(f"epoch_{state.epoch}_gpu_percent", torch.cuda.utilization())
+            mlflow.log_metric(f"epoch_{state.epoch}_gpu_memory_percent", 
+                            torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() * 100)
+        
+    def on_step_begin(self, args, state, control):
+        """Called when a training step begins."""
+        self.step_start_time = time.time()
+        
+    def on_step_end(self, args, state, control):
+        """Called when a training step ends."""
+        if self.step_start_time:
+            step_duration = time.time() - self.step_start_time
+            mlflow.log_metric(f"step_{state.global_step}_duration", step_duration)
+            
+            # Log step metrics
+            if state.log_history:
+                for log in state.log_history:
+                    if isinstance(log, dict):
+                        for key, value in log.items():
+                            if isinstance(value, (int, float)):
+                                mlflow.log_metric(f"step_{state.global_step}_{key}", value)
+        
+    def on_evaluate(self, args, state, control, metrics=None):
+        """Called after evaluation."""
+        if metrics:
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    mlflow.log_metric(f"eval_{key}", value)
+                    
+    def on_save(self, args, state, control):
+        """Called when a checkpoint is saved."""
+        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if os.path.exists(checkpoint_path):
+            mlflow.log_artifact(checkpoint_path, f"checkpoint_{state.global_step}")
 
 class InferencePipeLine():
     def __init__(self, task_type, checkpoint, adapter_config=None):
@@ -157,7 +251,6 @@ class InferencePipeLine():
                             metadata=adapter_conf.get('metadata')
                         )
             except Exception as e:
-                import logging
                 logging.error(f"Failed to preload adapter {adapter_id}: {str(e)}")
         
         self.has_adapter_support = True
@@ -247,7 +340,6 @@ class InferencePipeLine():
                 return result
             
             except Exception as e:
-                import logging
                 logging.error(f"Error using adapter {adapter_id}: {str(e)}")
                 logging.info(f"Falling back to base model")
                 # Fall back to base model
@@ -312,43 +404,179 @@ class InferencePipeLine():
         return self.adapter_manager.list_adapters()[0]['id']
 
 class FineTunePipeLine():
-    def __init__(self, args_dir, task_type,
-                chosen_metric=None, quantization=None,
-                peft_method=None, peft_config=None, use_lightning=False, use_accelerate=False):
-        """
-        Initialize the fine-tuning pipeline.
+    def __init__(self, args_dir: str, specs: Dict[str, Any] = None):
+        """Initialize the finetuning pipeline with MLflow tracking."""
+        self.specs = {**DEFAULT_SPECS, **(specs or {})}
+        self.args_dir = args_dir
         
-        Args:
-            args_dir: Directory containing configuration arguments
-            task_type: Type of task (e.g., masked_language_modeling, token_classification)
-            chosen_metric: Metric to use for evaluation
-            quantization: Quantization configuration
-            peft_method: PEFT method to use
-            peft_config: PEFT configuration
-            use_lightning: Whether to use PyTorch Lightning
-            use_accelerate: Whether to use Hugging Face Accelerate
-        """
-        self.task_type = task_type
-        self.specs = {**DEFAULT_SPECS}
-        if args_dir is not None:
-            self.specs.update(json.load(open(args_dir, 'r')))
+        # Initialize MLflow tracking
+        self.experiment_name = self.specs.get("experiment_name", "default_experiment")
+        self.tracking_uri = self.specs.get("tracking_uri", "sqlite:///mlflow.db")
         
-        self.chosen_metric = chosen_metric
-        self.quantization = quantization
-        self.peft_method = peft_method
-        self.peft_config = peft_config
-        self.use_lightning = use_lightning
-        self.use_accelerate = use_accelerate
+        mlflow.set_tracking_uri(self.tracking_uri)
+        mlflow.set_experiment(self.experiment_name)
         
-        # Initialize managers and modules
-        self.checkpoint_manager = None
-        self.quantization_manager = None
-        self.model_modules = None
-        self.tokenizer_modules = None
-        self.dataset_modules = None
+        # Start MLflow run
+        self.run = mlflow.start_run(run_name=f"finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        self.run_id = self.run.info.run_id
         
-        # Load specifications and initialize components
-        self.load_specs()
+        # Log initial metadata
+        mlflow.log_param("start_time", datetime.now().isoformat())
+        mlflow.log_param("task_type", self.specs.get("task_type", "unknown"))
+        mlflow.log_param("model_name", self.specs.get("model_name", "unknown"))
+        mlflow.log_param("data_source", self.specs.get("data_source", "unknown"))
+        
+        # Initialize components
+        self.model_modules = ModelModules(self.specs)
+        self.tokenizer_modules = TokenizerModules(self.specs)
+        self.dataset_modules = DatasetModules(self.specs.get("dataset_dir"), self.tokenizer_modules.tokenizer, self.specs)
+        
+        # Load configurations
+        self._load_configs()
+        
+    def _load_configs(self):
+        """Load configurations from args directory."""
+        try:
+            # Load training arguments
+            with open(os.path.join(self.args_dir, "training_args.json"), "r") as f:
+                self.training_args = json.load(f)
+                
+            # Load model arguments
+            with open(os.path.join(self.args_dir, "model_args.json"), "r") as f:
+                self.model_args = json.load(f)
+                
+            # Log configurations to MLflow
+            mlflow.log_dict(self.training_args, "training_args.json")
+            mlflow.log_dict(self.model_args, "model_args.json")
+            
+        except Exception as e:
+            logging.error(f"Failed to load configurations: {e}")
+            raise
+            
+    def prepare_optimizer(self):
+        """Prepare optimizer with MLflow tracking."""
+        try:
+            optimizer = AdamW(
+                self.model_modules.model.parameters(),
+                lr=self.training_args.get("learning_rate", 2e-5),
+                weight_decay=self.training_args.get("weight_decay", 0.01)
+            )
+            
+            # Log optimizer configuration
+            mlflow.log_param("optimizer_type", "AdamW")
+            mlflow.log_param("learning_rate", self.training_args.get("learning_rate", 2e-5))
+            mlflow.log_param("weight_decay", self.training_args.get("weight_decay", 0.01))
+            
+            return optimizer
+            
+        except Exception as e:
+            logging.error(f"Failed to prepare optimizer: {e}")
+            raise
+            
+    def prepare_data_collator(self):
+        """Prepare data collator with MLflow tracking."""
+        try:
+            task_type = self.specs.get("task_type", "unknown")
+            
+            if task_type == "masked_language_modeling":
+                collator = DataCollatorForLanguageModeling(
+                    tokenizer=self.tokenizer_modules.tokenizer,
+                    mlm=True,
+                    mlm_probability=0.15
+                )
+            elif task_type == "token_classification":
+                collator = DataCollatorForTokenClassification(
+                    tokenizer=self.tokenizer_modules.tokenizer
+                )
+            elif task_type in ["translation", "summarization"]:
+                collator = DataCollatorForSeq2Seq(
+                    tokenizer=self.tokenizer_modules.tokenizer
+                )
+            else:
+                collator = default_data_collator
+                
+            # Log collator configuration
+            mlflow.log_param("data_collator_type", collator.__class__.__name__)
+            
+            return collator
+            
+        except Exception as e:
+            logging.error(f"Failed to prepare data collator: {e}")
+            raise
+            
+    def run(self):
+        """Run the finetuning pipeline with MLflow tracking."""
+        try:
+            start_time = time.time()
+            
+            # Prepare model
+            logging.info("Preparing model...")
+            self.model_modules.prepare_model()
+            
+            # Prepare optimizer
+            logging.info("Preparing optimizer...")
+            optimizer = self.prepare_optimizer()
+            
+            # Prepare data collator
+            logging.info("Preparing data collator...")
+            data_collator = self.prepare_data_collator()
+            
+            # Prepare dataset
+            logging.info("Preparing dataset...")
+            dataset = self.dataset_modules.prepare_dataset_from_dir(self.specs.get("task_type"))
+            
+            # Initialize trainer with MLflow callback
+            logging.info("Initializing trainer...")
+            trainer_class = self._get_trainer_class()
+            trainer = trainer_class(
+                model=self.model_modules.model,
+                args=self.training_args,
+                train_dataset=dataset["train"],
+                eval_dataset=dataset["eval"],
+                data_collator=data_collator,
+                optimizers=(optimizer, None),
+                callbacks=[MLflowCallback(self.run_id)]
+            )
+            
+            # Train the model
+            logging.info("Starting training...")
+            trainer.train()
+            
+            # Save the model
+            logging.info("Saving model...")
+            trainer.save_model()
+            
+            # Log final metrics
+            total_duration = time.time() - start_time
+            mlflow.log_metric("total_training_duration", total_duration)
+            mlflow.log_param("end_time", datetime.now().isoformat())
+            
+            # Log model artifacts
+            model_path = os.path.join(self.training_args.get("output_dir", "output"), "final_model")
+            if os.path.exists(model_path):
+                mlflow.log_artifact(model_path, "final_model")
+                
+            # End MLflow run
+            mlflow.end_run()
+            
+        except Exception as e:
+            logging.error(f"Error in pipeline execution: {e}")
+            mlflow.end_run(status="FAILED")
+            raise
+            
+    def _get_trainer_class(self):
+        """Get appropriate trainer class based on task type."""
+        task_type = self.specs.get("task_type", "unknown")
+        use_lightning = self.specs.get("use_lightning", False)
+        
+        if task_type in ["translation", "summarization"]:
+            if use_lightning:
+                return AcceleratedNLPSeq2SeqTrainerWithLightning
+            return AcceleratedNLPSeq2SeqTrainer
+        else:
+            if use_lightning:
+                return AcceleratedNLPTrainerWithLightning
+            return AcceleratedNLPTrainer
 
     def _prepare_fallback_optimizer(self, model):
         """

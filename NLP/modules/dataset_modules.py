@@ -1,32 +1,40 @@
-from datasets import load_dataset
-import polars as pl
-from typing import Dict, List, Optional, Union, Any, Tuple, Callable
-import logging
-from dataclasses import dataclass
-from functools import lru_cache
-import numpy as np
-from tqdm import tqdm
-import torch.distributed as dist
-from torch.utils.data import DistributedSampler
-import os
-import json
-from pathlib import Path
-import time
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import psutil
-from dataclasses import asdict
-import threading
-from queue import Queue
-import ray
-from collections import defaultdict
+# Standard library imports
 import hashlib
+import json
+import logging
+import os
 import pickle
-from datetime import datetime
 import sys
+import threading
+import time
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+from queue import Queue
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# Third-party imports
+import numpy as np
+import polars as pl
+import psutil
+import ray
 import torch
-from torch.utils.data import DataLoader, Dataset as TorchDataset
-from transformers import DataCollatorForLanguageModeling, DataCollatorForTokenClassification, DataCollatorForSeq2Seq
-from transformers import default_data_collator
+import torch.distributed as dist
+from datasets import load_dataset
+from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset as TorchDataset, DistributedSampler
+from transformers import (
+    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
+    DataCollatorForTokenClassification,
+    default_data_collator
+)
+
+# Local imports
+from .mlflow_tracking import MLflowTracker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -317,6 +325,27 @@ class DatasetModules:
                 'adaptive_batching': specs.get('adaptive_batching', True)
             })
             
+            # Initialize MLflow tracker
+            self.mlflow_tracker = MLflowTracker(
+                experiment_name=specs.get("experiment_name", "default_experiment"),
+                tracking_uri=specs.get("tracking_uri", "sqlite:///mlflow.db")
+            )
+            self.mlflow_tracker.start_run()
+            
+            # Log initial experiment metadata
+            self.mlflow_tracker.log_experiment_metadata({
+                "task_type": specs.get("task_type", "unknown"),
+                "data_source": dataset_dir,
+                "model_name": specs.get("model_name", "unknown"),
+                "max_length": self.config.max_length,
+                "batch_size": self.config.batch_size,
+                "chunk_size": self.config.chunk_size,
+                "stride": self.config.stride,
+                "distributed": self.config.distributed,
+                "world_size": self.config.world_size,
+                "local_rank": self.config.local_rank
+            })
+            
             # Initialize monitoring and optimization components
             self.monitor = ParallelProcessingMonitor(self.config)
             self.batch_sizer = AdaptiveBatchSizer(self.config)
@@ -389,12 +418,24 @@ class DatasetModules:
             if quality_metrics.quality_score < 0.8:  # Configurable threshold
                 logger.warning(f"Low data quality score: {quality_metrics.quality_score}")
             
+            # Log dataset metrics
+            self.mlflow_tracker.log_dataset_metrics({
+                "size": len(next(iter(examples.values()))),
+                "quality_score": quality_metrics.quality_score,
+                "null_count": quality_metrics.null_count,
+                "duplicate_count": quality_metrics.duplicate_count,
+                "invalid_format_count": quality_metrics.invalid_format_count,
+                "out_of_range_count": quality_metrics.out_of_range_count
+            })
+            
             # Process in chunks with checkpointing
             df = pl.DataFrame(examples)
             results = []
             current_pos = 0
             
             while current_pos < len(df):
+                chunk_start_time = time.time()
+                
                 # Load checkpoint if exists
                 checkpoint = self.checkpoint_manager.load_checkpoint(self.task_type, current_pos)
                 if checkpoint:
@@ -408,13 +449,25 @@ class DatasetModules:
                 results.append(processed_chunk)
                 
                 # Save checkpoint
-                self.checkpoint_manager.save_checkpoint(results, self.task_type, current_pos)
+                checkpoint_path = self.checkpoint_manager.save_checkpoint(results, self.task_type, current_pos)
+                if checkpoint_path:
+                    self.mlflow_tracker.log_artifact(str(checkpoint_path), "checkpoint")
+                
+                # Log timing and resource metrics
+                chunk_duration = time.time() - chunk_start_time
+                self.mlflow_tracker.log_timing_metric("chunk_processing", chunk_duration)
+                self.mlflow_tracker.log_resource_metrics()
+                
                 current_pos += self.config.batch_size
             
             # Combine and validate results
             combined = self._combine_results(results)
             if not self.validator.validate_schema(combined, self._get_expected_schema()):
                 raise ValueError("Invalid output data schema")
+            
+            # Log total processing time
+            total_duration = time.time() - start_time
+            self.mlflow_tracker.log_timing_metric("total_processing", total_duration)
             
             return combined
             
@@ -477,6 +530,8 @@ class DatasetModules:
         self.monitor.stop_monitoring()
         if ray.is_initialized():
             ray.shutdown()
+        if hasattr(self, 'mlflow_tracker'):
+            self.mlflow_tracker.end_run()
 
     def _cache_processed_data(self, data: Dict[str, List], cache_key: str):
         """Cache processed data based on strategy."""
@@ -757,6 +812,7 @@ class DatasetModules:
     def prepare_dataset(self, dataset: Any, task_type: str) -> Dict[str, Any]:
         """Prepare dataset with distributed training support."""
         try:
+            start_time = time.time()
             self.task_type = task_type
             self.raw_dataset = dataset
             
@@ -810,6 +866,10 @@ class DatasetModules:
                     eval_dataset,
                     self.group_texts
                 )
+            
+            # Log dataset preparation metrics
+            total_duration = time.time() - start_time
+            self.mlflow_tracker.log_timing_metric("dataset_preparation", total_duration)
             
             return {
                 "train": train_dataset,
