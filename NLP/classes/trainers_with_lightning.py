@@ -15,19 +15,49 @@ from torch.utils.data import DataLoader
 
 @dataclass
 class PeftConfig:
-    """Configuration for PEFT models"""
+    """Configuration for PEFT models with enhanced optimization settings"""
     peft_type: str
     task_type: str
     inference_mode: bool = False
-    r: int = 8
+    r: int = 16  # Aligned with default_config
     lora_alpha: int = 32
-    lora_dropout: float = 0.1
+    lora_dropout: float = 0.05  # Aligned with default_config
     bias: str = "none"
     target_modules: List[str] = None
     layers_to_transform: List[int] = None
     fan_in_fan_out: bool = False
     modules_to_save: List[str] = None
     init_lora_weights: bool = True
+    
+    # Memory optimization settings
+    use_gradient_checkpointing: bool = True
+    use_cache: bool = False
+    
+    # Quantization settings
+    quantization_type: Optional[str] = None
+    quantization_bits: Optional[int] = None
+    
+    @classmethod
+    def from_pretrained(cls, model):
+        """Create config from a pretrained PEFT model"""
+        if not hasattr(model, "peft_config"):
+            return None
+        config = model.peft_config
+        return cls(
+            peft_type=getattr(config, "peft_type", "unknown"),
+            task_type=getattr(config, "task_type", "unknown"),
+            r=getattr(config, "r", 16),
+            lora_alpha=getattr(config, "lora_alpha", 32),
+            lora_dropout=getattr(config, "lora_dropout", 0.05),
+            bias=getattr(config, "bias", "none"),
+            target_modules=getattr(config, "target_modules", None),
+            layers_to_transform=getattr(config, "layers_to_transform", None),
+            fan_in_fan_out=getattr(config, "fan_in_fan_out", False),
+            modules_to_save=getattr(config, "modules_to_save", None),
+            init_lora_weights=getattr(config, "init_lora_weights", True),
+            use_gradient_checkpointing=True,
+            use_cache=False
+        )
 
 class NLPTrainer(pl.LightningModule):
     """
@@ -137,7 +167,7 @@ class NLPTrainer(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """
-        Perform a single training step.
+        Enhanced training step with PEFT-aware gradient handling.
         
         Args:
             batch: The batch of data for the current step.
@@ -146,10 +176,109 @@ class NLPTrainer(pl.LightningModule):
         Returns:
             Loss from the current training step.
         """
+        # Forward pass
         outputs = self.forward(**batch)
         loss = outputs.loss
+        
+        # Scale loss based on PEFT type
+        if self.is_peft_model and hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # Scale based on LoRA alpha
+                loss = loss / getattr(self.model.peft_config, "lora_alpha", 32)
+            elif "PREFIX" in peft_type:
+                # Prefix tuning might need different scaling
+                loss = loss * 1.2  # Slight upscaling for prefix tuning
+        
+        # Apply gradient clipping if specified
+        if self.specs.get('max_grad_norm', 1.0) > 0 and self.is_peft_model:
+            self.clip_gradients(loss)
+        
+        # Log metrics
         self.log('train_loss', loss)
+        
         return loss
+
+    def clip_gradients(self, loss):
+        """
+        Clip gradients with PEFT-specific handling.
+        
+        Args:
+            loss: The loss value from the current step.
+        """
+        if not self.is_peft_model:
+            return
+
+        try:
+            # Get trainable parameters
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            
+            # Different clipping strategies based on PEFT type
+            if hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # For LoRA, we can use more aggressive clipping
+                    max_grad_norm = self.specs.get('max_grad_norm', 1.0) * 1.5
+                elif "PREFIX" in peft_type:
+                    # For prefix tuning, we need more conservative clipping
+                    max_grad_norm = self.specs.get('max_grad_norm', 1.0) * 0.8
+                else:
+                    max_grad_norm = self.specs.get('max_grad_norm', 1.0)
+                
+                # Apply gradient clipping
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+                
+                # Log gradient norms if in debug mode
+                if self.specs.get('debug_gradients', False):
+                    grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params]))
+                    self.log('gradient_norm', grad_norm)
+        except Exception as e:
+            print(f"Error in gradient clipping: {e}")
+
+    def on_before_optimizer_step(self, optimizer):
+        """
+        Handle gradient operations before optimizer step.
+        
+        Args:
+            optimizer: The optimizer being used.
+        """
+        if not self.is_peft_model:
+            return
+
+        # Check for NaN or Inf gradients
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                valid_gradients = not (torch.isnan(param.grad).any() or torch.isinf(param.grad).any())
+                if not valid_gradients:
+                    print(f"Warning: Invalid gradients detected in {name}")
+                    param.grad.data = torch.zeros_like(param.grad.data)
+
+        # Gradient scaling for different PEFT types
+        if hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                self._scale_lora_gradients()
+            elif "PREFIX" in peft_type:
+                self._scale_prefix_gradients()
+
+    def _scale_lora_gradients(self):
+        """Scale gradients specifically for LoRA parameters."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                # Scale LoRA gradients
+                if 'lora_' in name:
+                    if param.grad is not None:
+                        param.grad.data = param.grad.data / self.model.peft_config.lora_alpha
+
+    def _scale_prefix_gradients(self):
+        """Scale gradients specifically for prefix tuning parameters."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                # Scale prefix tuning gradients
+                if 'prefix' in name:
+                    if param.grad is not None:
+                        # Apply more conservative updates to prefix parameters
+                        param.grad.data = param.grad.data * 0.8
 
     def validation_step(self, batch, batch_idx):
         """
@@ -168,86 +297,184 @@ class NLPTrainer(pl.LightningModule):
         return val_loss
 
     def configure_optimizers(self):
-        """Configure optimizers with special handling for PEFT models."""
+        """Enhanced optimizer configuration with PEFT-specific optimizations."""
         if self.optimizer is not None and self.scheduler is not None:
             return {'optimizer': self.optimizer, 'lr_scheduler': self.scheduler}
 
-        # Check if this is a PEFT model
-        try:
-            from peft.utils import get_peft_model_state_dict
-            # Try to access PEFT-specific attributes
-            _ = get_peft_model_state_dict(self.model)
-            # This is a PEFT model - only train the parameters that require gradients
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.specs['learning_rate'],
-                weight_decay=self.specs.get('weight_decay', 0.01)
-            )
-            print(f"Configured optimizer for PEFT model with {len(trainable_params)} trainable parameters")
-        except (ImportError, ValueError, AttributeError, TypeError):
-            # For regular models, train all parameters
-            optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=self.specs['learning_rate'],
-                weight_decay=self.specs.get('weight_decay', 0.01)
-            )
-            print("Configured optimizer for standard model (non-PEFT)")
-
-        return {'optimizer': optimizer}
+        if self.is_peft_model:
+            # Get trainable parameters for PEFT
+            trainable_params = []
+            all_param_size = 0
+            trainable_param_size = 0
+            
+            for name, param in self.model.named_parameters():
+                all_param_size += param.numel()
+                if param.requires_grad:
+                    trainable_params.append(param)
+                    trainable_param_size += param.numel()
+            
+            # Log parameter statistics
+            print(f"Total parameters: {all_param_size:,}")
+            print(f"Trainable parameters: {trainable_param_size:,}")
+            print(f"Parameter efficiency ratio: {100 * trainable_param_size / all_param_size:.2f}%")
+            
+            # Configure optimizer with PEFT-specific settings
+            optimizer_kwargs = {
+                'lr': self.specs['learning_rate'],
+                'weight_decay': self.specs.get('weight_decay', 0.01),
+                'eps': self.specs.get('adam_epsilon', 1e-8),
+                'betas': (self.specs.get('adam_beta1', 0.9), self.specs.get('adam_beta2', 0.999))
+            }
+            
+            # Use different optimizers based on PEFT type
+            if hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # For LoRA, we can use a higher learning rate
+                    optimizer_kwargs['lr'] *= 2
+                elif "PREFIX" in peft_type:
+                    # For prefix tuning, we need more conservative updates
+                    optimizer_kwargs['lr'] *= 0.5
+                    optimizer_kwargs['weight_decay'] *= 2
+            
+            optimizer = torch.optim.AdamW(trainable_params, **optimizer_kwargs)
+            print(f"Configured optimizer with settings: {optimizer_kwargs}")
+            
+            # Configure scheduler if needed
+            if self.specs.get('scheduler_strategy', 'linear') == 'linear':
+                from transformers import get_linear_schedule_with_warmup
+                num_training_steps = self.trainer.estimated_stepping_batches
+                num_warmup_steps = int(num_training_steps * self.specs.get('warmup_ratio', 0.1))
+                
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps
+                )
+                print(f"Configured linear scheduler with {num_warmup_steps} warmup steps")
+                
+                return {
+                    'optimizer': optimizer,
+                    'lr_scheduler': {
+                        'scheduler': scheduler,
+                        'interval': 'step'
+                    }
+                }
+            
+            return optimizer
+        
+        # For non-PEFT models, use standard optimization
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.specs['learning_rate'],
+            weight_decay=self.specs.get('weight_decay', 0.01)
+        )
+        return optimizer
 
     def on_fit_start(self):
-        """Set up training-specific configurations for PEFT models."""
+        """Enhanced training setup with optimized memory handling for PEFT models."""
         super().on_fit_start()
         
         if self.is_peft_model:
-            # Enable gradient checkpointing if available
-            if hasattr(self.model, "gradient_checkpointing_enable"):
+            # Get PEFT configuration
+            peft_config = self.peft_config or PeftConfig.from_pretrained(self.model)
+            
+            # Enable gradient checkpointing if specified
+            if peft_config.use_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
                 self.model.gradient_checkpointing_enable()
                 print("Enabled gradient checkpointing for PEFT model")
             
-            # Configure model for memory efficiency
-            if hasattr(self.model, "config"):
+            # Disable model caching if specified
+            if not peft_config.use_cache and hasattr(self.model, "config"):
                 self.model.config.use_cache = False
+                print("Disabled model caching for memory efficiency")
+            
+            # Handle quantization settings
+            if peft_config.quantization_type:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=peft_config.quantization_type == "4bit",
+                        load_in_8bit=peft_config.quantization_type == "8bit",
+                        bnb_4bit_compute_dtype=torch.float16
+                    )
+                    print(f"Applied {peft_config.quantization_type} quantization")
+                except ImportError:
+                    print("BitsAndBytes not available for quantization")
+            
+            # Adjust batch size based on PEFT type
+            if hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    self.trainer.accumulate_grad_batches = max(1, self.trainer.accumulate_grad_batches // 2)
+                elif "PREFIX" in peft_type:
+                    self.trainer.accumulate_grad_batches = self.trainer.accumulate_grad_batches * 2
+                print(f"Adjusted gradient accumulation for {peft_type}: {self.trainer.accumulate_grad_batches} steps")
 
     def on_save_checkpoint(self, checkpoint):
-        """Enhanced checkpoint saving for PEFT models"""
-        # First call parent class method
+        """Enhanced checkpoint saving with comprehensive PEFT state management."""
         checkpoint = super().on_save_checkpoint(checkpoint)
         
-        # Add PEFT-specific state
-        try:
-            from peft import PeftModel
-            if isinstance(self.model, PeftModel):
-                # Save PEFT-specific state
+        if self.is_peft_model:
+            try:
+                # Save PEFT adapter state
                 checkpoint['peft_adapter_state'] = self.model.get_adapter_state_dict()
-                print("Saved PEFT adapter state to checkpoint")
                 
-                # Save additional PEFT-specific information
+                # Save PEFT configuration
                 if hasattr(self.model, "peft_config"):
                     checkpoint['peft_config'] = self.model.peft_config
-        except (ImportError, AttributeError):
-            pass
-            
+                    checkpoint['peft_type'] = self.model.peft_config.peft_type
+                
+                # Save quantization state if applicable
+                if hasattr(self.model, "quantization_config"):
+                    checkpoint['quantization_config'] = self.model.quantization_config
+                
+                # Save additional training state
+                checkpoint['peft_training_state'] = {
+                    'current_lora_alpha': getattr(self.model.peft_config, "lora_alpha", None),
+                    'current_r': getattr(self.model.peft_config, "r", None),
+                    'trainable_params': sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+                    'total_params': sum(p.numel() for p in self.model.parameters())
+                }
+                
+                print("Saved complete PEFT state to checkpoint")
+            except Exception as e:
+                print(f"Error saving PEFT state: {str(e)}")
+        
         return checkpoint
     
     def on_load_checkpoint(self, checkpoint):
-        """Enhanced checkpoint loading for PEFT models"""
-        # First call parent class method
+        """Enhanced checkpoint loading with comprehensive PEFT state restoration."""
         super().on_load_checkpoint(checkpoint)
         
-        # Load PEFT-specific state
-        try:
-            from peft import PeftModel
-            if isinstance(self.model, PeftModel):
+        if self.is_peft_model:
+            try:
+                # Restore PEFT adapter state
                 if 'peft_adapter_state' in checkpoint:
                     self.model.load_adapter_state_dict(checkpoint['peft_adapter_state'])
-                    print("Loaded PEFT adapter state from checkpoint")
-                    
+                    print("Restored PEFT adapter state")
+                
+                # Restore PEFT configuration
                 if 'peft_config' in checkpoint:
                     self.model.peft_config = checkpoint['peft_config']
-        except (ImportError, AttributeError):
-            pass
+                    print(f"Restored PEFT configuration for type: {checkpoint.get('peft_type', 'unknown')}")
+                
+                # Restore quantization configuration
+                if 'quantization_config' in checkpoint and hasattr(self.model, "quantization_config"):
+                    self.model.quantization_config = checkpoint['quantization_config']
+                    print("Restored quantization configuration")
+                
+                # Verify training state
+                if 'peft_training_state' in checkpoint:
+                    current_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                    saved_trainable = checkpoint['peft_training_state']['trainable_params']
+                    if current_trainable != saved_trainable:
+                        print(f"Warning: Current trainable parameters ({current_trainable}) "
+                              f"differ from checkpoint ({saved_trainable})")
+                
+                print("Completed PEFT state restoration")
+            except Exception as e:
+                print(f"Error loading PEFT state: {str(e)}")
 
     def print_args(self):
         """
@@ -354,6 +581,83 @@ class NLPSeq2SeqTrainer(NLPTrainer):
             elif "PREFIX" in self.peft_config.peft_type:
                 # Prefix tuning might need different settings
                 self.generation_config.num_beams = max(2, self.generation_config.num_beams - 1)
+
+    def training_step(self, batch, batch_idx):
+        """
+        Enhanced training step for Seq2Seq models with PEFT-aware gradient handling.
+        
+        Args:
+            batch: The batch of data for the current step.
+            batch_idx: The index of the batch.
+        
+        Returns:
+            Loss from the current training step.
+        """
+        # Forward pass with teacher forcing
+        outputs = self.forward(**batch)
+        loss = outputs.loss
+        
+        # Scale loss based on PEFT type and Seq2Seq specific considerations
+        if self.is_peft_model and hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # For Seq2Seq LoRA, we might need different scaling
+                loss = loss / (getattr(self.model.peft_config, "lora_alpha", 32) * 1.2)
+            elif "PREFIX" in peft_type:
+                # For Seq2Seq prefix tuning
+                loss = loss * 1.1
+        
+        # Apply gradient clipping with Seq2Seq specific thresholds
+        if self.specs.get('max_grad_norm', 1.0) > 0 and self.is_peft_model:
+            # Use more conservative clipping for Seq2Seq models
+            self.specs['max_grad_norm'] = self.specs.get('max_grad_norm', 1.0) * 0.9
+            self.clip_gradients(loss)
+        
+        # Log metrics
+        self.log('train_loss', loss)
+        
+        return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        """
+        Enhanced gradient handling for Seq2Seq models before optimizer step.
+        
+        Args:
+            optimizer: The optimizer being used.
+        """
+        super().on_before_optimizer_step(optimizer)
+        
+        if self.is_peft_model:
+            # Additional Seq2Seq specific gradient handling
+            self._handle_seq2seq_gradients()
+
+    def _handle_seq2seq_gradients(self):
+        """Handle gradients specifically for Seq2Seq PEFT models."""
+        if not hasattr(self.model, "peft_config"):
+            return
+            
+        # Get encoder and decoder parameters
+        encoder_params = []
+        decoder_params = []
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if 'encoder' in name:
+                    encoder_params.append(param)
+                elif 'decoder' in name:
+                    decoder_params.append(param)
+        
+        # Apply different scaling to encoder and decoder gradients
+        if self.model.peft_config.peft_type == "LORA":
+            # Scale encoder gradients more conservatively
+            for param in encoder_params:
+                if param.grad is not None:
+                    param.grad.data = param.grad.data * 0.9
+            
+            # Scale decoder gradients more aggressively
+            for param in decoder_params:
+                if param.grad is not None:
+                    param.grad.data = param.grad.data * 1.1
 
     def validation_step(self, batch, batch_idx):
         """Specialized validation step for Seq2Seq models with PEFT support"""

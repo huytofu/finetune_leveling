@@ -470,6 +470,102 @@ class AcceleratedNLPTrainer():
             # TO ADD LATER
             pass
 
+    def _handle_gradients(self, loss, step):
+        """Handle gradients with PEFT-specific optimizations and Accelerator integration"""
+        if not self.is_peft_model:
+            return loss
+
+        # Scale loss based on PEFT type
+        if hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # Scale based on LoRA alpha
+                loss = loss / getattr(self.model.peft_config, "lora_alpha", 32)
+            elif "PREFIX" in peft_type:
+                # Prefix tuning might need different scaling
+                loss = loss * 1.2
+
+        # Scale loss for gradient accumulation
+        if self.specs.get('gradient_accumulation_steps', 1) > 1:
+            loss = loss / self.specs['gradient_accumulation_steps']
+
+        # Backward pass with Accelerator
+        self.accelerator.backward(loss)
+
+        # Apply gradient clipping on accumulation step
+        if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
+            if self.specs.get('max_grad_norm', 1.0) > 0:
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                if hasattr(self.model, "peft_config"):
+                    peft_type = self.model.peft_config.peft_type
+                    if peft_type == "LORA":
+                        # More aggressive clipping for LoRA
+                        max_grad_norm = self.specs.get('max_grad_norm', 1.0) * 1.5
+                    elif "PREFIX" in peft_type:
+                        # More conservative clipping for prefix tuning
+                        max_grad_norm = self.specs.get('max_grad_norm', 1.0) * 0.8
+                    else:
+                        max_grad_norm = self.specs.get('max_grad_norm', 1.0)
+                        
+                    self.accelerator.clip_grad_norm_(trainable_params, max_grad_norm)
+
+            # Scale gradients based on PEFT type
+            self._scale_gradients()
+
+        return loss
+
+    def _scale_gradients(self):
+        """Apply PEFT-specific gradient scaling with Accelerator integration"""
+        if not self.is_peft_model or not hasattr(self.model, "peft_config"):
+            return
+
+        peft_type = self.model.peft_config.peft_type
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+
+            # Check for NaN or Inf gradients
+            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                Logger.warning(f"Invalid gradients detected in {name}")
+                param.grad.data = torch.zeros_like(param.grad.data)
+                continue
+
+            if peft_type == "LORA" and "lora_" in name:
+                # Scale LoRA gradients
+                param.grad.data = param.grad.data / self.model.peft_config.lora_alpha
+            elif "PREFIX" in peft_type and "prefix" in name:
+                # More conservative updates for prefix parameters
+                param.grad.data = param.grad.data * 0.8
+
+    def _train_step(self, batch, step):
+        """Enhanced training step with PEFT-aware gradient handling"""
+        try:
+            # Forward pass with Accelerator's autocast
+            with self.accelerator.autocast():
+                outputs = self.model(**batch)
+                loss = outputs.loss
+
+            # Handle gradients
+            loss = self._handle_gradients(loss, step)
+
+            # Update on accumulation step
+            if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+
+            # Log metrics
+            if self.specs.get('debug_gradients', False):
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params if p.grad is not None]))
+                Logger.debug(f"Gradient norm at step {step}: {grad_norm}")
+
+            return loss.item()
+
+        except Exception as e:
+            ErrorHandler.handle_error(e, f"Training step {step}")
+            return None
+
     def train(self):
         """
         Train the model with mixed precision and gradient accumulation.
@@ -488,25 +584,6 @@ class AcceleratedNLPTrainer():
             self._compute_metrics()
             self.save_and_upload(epoch)
             logging.info(f"Completed epoch {epoch}")
-
-    def _train_step(self, batch, step):
-        """
-        Perform a single training step.
-        
-        Args:
-            batch: The batch of data for the current step.
-            step: The current step number.
-        """
-        with self.accelerator.autocast():  # Use mixed precision
-            outputs = self.model(**batch)
-            loss = outputs.loss / self.specs['gradient_accumulation_steps']
-        self.accelerator.backward(loss)
-
-        if (step + 1) % self.specs['gradient_accumulation_steps'] == 0:
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
-            self.progress_bar.update(1)
 
     def _eval_step(self, batch, step):
         """
@@ -578,12 +655,88 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
                 # Prefix tuning might need different settings
                 self.generation_config.num_beams = max(2, self.generation_config.num_beams - 1)
                 
+    def _handle_seq2seq_gradients(self, loss, step):
+        """Handle gradients specifically for Seq2Seq PEFT models with Accelerator integration"""
+        if not self.is_peft_model:
+            return loss
+
+        # Scale loss based on PEFT type with Seq2Seq adjustments
+        if hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # Different scaling for Seq2Seq LoRA
+                loss = loss / (getattr(self.model.peft_config, "lora_alpha", 32) * 1.2)
+            elif "PREFIX" in peft_type:
+                # Different scaling for Seq2Seq prefix tuning
+                loss = loss * 1.1
+
+        # Scale loss for gradient accumulation
+        if self.specs.get('gradient_accumulation_steps', 1) > 1:
+            loss = loss / self.specs['gradient_accumulation_steps']
+
+        # Backward pass with Accelerator
+        self.accelerator.backward(loss)
+
+        # Apply gradient clipping on accumulation step
+        if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
+            if self.specs.get('max_grad_norm', 1.0) > 0:
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                # More conservative clipping for Seq2Seq models
+                max_grad_norm = self.specs.get('max_grad_norm', 1.0) * 0.9
+                self.accelerator.clip_grad_norm_(trainable_params, max_grad_norm)
+
+            # Scale gradients with Seq2Seq specific handling
+            self._scale_seq2seq_gradients()
+
+        return loss
+
+    def _scale_seq2seq_gradients(self):
+        """Scale gradients specifically for Seq2Seq PEFT models"""
+        if not self.is_peft_model or not hasattr(self.model, "peft_config"):
+            return
+
+        # Get encoder and decoder parameters
+        encoder_params = []
+        decoder_params = []
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                # Check for NaN or Inf gradients
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    Logger.warning(f"Invalid gradients detected in {name}")
+                    param.grad.data = torch.zeros_like(param.grad.data)
+                    continue
+
+                if 'encoder' in name:
+                    encoder_params.append(param)
+                elif 'decoder' in name:
+                    decoder_params.append(param)
+
+        # Apply different scaling to encoder and decoder gradients
+        if self.model.peft_config.peft_type == "LORA":
+            # Scale encoder gradients more conservatively
+            for param in encoder_params:
+                param.grad.data = param.grad.data * 0.9
+            
+            # Scale decoder gradients more aggressively
+            for param in decoder_params:
+                param.grad.data = param.grad.data * 1.1
+
     def _train_step(self, batch, step):
-        """Specialized training step for Seq2Seq models with PEFT support"""
-        with self.accelerator.accumulate(self.model):
+        """Enhanced Seq2Seq training step with PEFT-aware gradient handling"""
+        try:
+            # Forward pass with Accelerator's autocast
             with self.accelerator.autocast():
                 outputs = self.model(**batch)
                 loss = outputs.loss
+
+            # Handle gradients with Seq2Seq specific handling
+            loss = self._handle_seq2seq_gradients(loss, step)
+
+            # Update on accumulation step
+            if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
+                self.optimizer.step()
+                self.lr_scheduler.step()
                 
                 if self.specs.get('gradient_accumulation_steps', 1) > 1:
                     loss = loss / self.specs['gradient_accumulation_steps']
@@ -615,7 +768,11 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             
             self.optimizer.zero_grad()
             
-        return loss.item()
+            return loss.item()
+
+        except Exception as e:
+            ErrorHandler.handle_error(e, f"Seq2Seq training step {step}")
+            return None
         
     def generate(self, batch):
         """Generate sequences with PEFT-aware handling"""

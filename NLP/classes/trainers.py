@@ -148,6 +148,73 @@ class NLPTrainer(Trainer):
         if self.is_peft_model:
             print("(with PEFT support)")
 
+    def _handle_gradients(self, loss):
+        """Handle gradients with PEFT-specific optimizations"""
+        if not self.is_peft_model:
+            return loss
+
+        # Scale loss based on PEFT type
+        if hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # Scale based on LoRA alpha
+                loss = loss / getattr(self.model.peft_config, "lora_alpha", 32)
+            elif "PREFIX" in peft_type:
+                # Prefix tuning might need different scaling
+                loss = loss * 1.2
+
+        # Apply gradient clipping
+        if self.args.max_grad_norm > 0:
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            if hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # More aggressive clipping for LoRA
+                    max_grad_norm = self.args.max_grad_norm * 1.5
+                elif "PREFIX" in peft_type:
+                    # More conservative clipping for prefix tuning
+                    max_grad_norm = self.args.max_grad_norm * 0.8
+                else:
+                    max_grad_norm = self.args.max_grad_norm
+                    
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+
+        return loss
+
+    def _scale_gradients(self):
+        """Apply PEFT-specific gradient scaling"""
+        if not self.is_peft_model or not hasattr(self.model, "peft_config"):
+            return
+
+        peft_type = self.model.peft_config.peft_type
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+
+            if peft_type == "LORA" and "lora_" in name:
+                # Scale LoRA gradients
+                param.grad.data = param.grad.data / self.model.peft_config.lora_alpha
+            elif "PREFIX" in peft_type and "prefix" in name:
+                # More conservative updates for prefix parameters
+                param.grad.data = param.grad.data * 0.8
+
+    def training_step(self, model, inputs, **kwargs):
+        """Enhanced training step with PEFT-aware gradient handling"""
+        outputs = super().training_step(model, inputs, **kwargs)
+        
+        if self.is_peft_model:
+            # Handle gradients before optimizer step
+            outputs["loss"] = self._handle_gradients(outputs["loss"])
+            self._scale_gradients()
+            
+            # Log gradient norms in debug mode
+            if self.args.debug:
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params]))
+                self.log({"gradient_norm": grad_norm})
+        
+        return outputs
+
 
 class NLPSeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(self, args_dir, model, tokenizer, 
@@ -343,3 +410,72 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
         print("I am a NLPSeq2SeqTrainer!")
         if self.is_peft_model:
             print("(with PEFT support)")
+
+    def training_step(self, model, inputs, **kwargs):
+        """Enhanced Seq2Seq training step with PEFT-aware gradient handling"""
+        outputs = super().training_step(model, inputs, **kwargs)
+        
+        if self.is_peft_model:
+            # Handle gradients with Seq2Seq specific adjustments
+            outputs["loss"] = self._handle_seq2seq_gradients(outputs["loss"])
+            self._scale_seq2seq_gradients()
+            
+            # Log gradient norms in debug mode
+            if self.args.debug:
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params]))
+                self.log({"gradient_norm": grad_norm})
+        
+        return outputs
+
+    def _handle_seq2seq_gradients(self, loss):
+        """Handle gradients specifically for Seq2Seq PEFT models"""
+        if not self.is_peft_model:
+            return loss
+
+        # Scale loss based on PEFT type with Seq2Seq adjustments
+        if hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # Different scaling for Seq2Seq LoRA
+                loss = loss / (getattr(self.model.peft_config, "lora_alpha", 32) * 1.2)
+            elif "PREFIX" in peft_type:
+                # Different scaling for Seq2Seq prefix tuning
+                loss = loss * 1.1
+
+        # Apply gradient clipping with Seq2Seq specific thresholds
+        if self.args.max_grad_norm > 0:
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            if hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                # More conservative clipping for Seq2Seq models
+                max_grad_norm = self.args.max_grad_norm * 0.9
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+
+        return loss
+
+    def _scale_seq2seq_gradients(self):
+        """Scale gradients specifically for Seq2Seq PEFT models"""
+        if not self.is_peft_model or not hasattr(self.model, "peft_config"):
+            return
+
+        # Get encoder and decoder parameters
+        encoder_params = []
+        decoder_params = []
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                if 'encoder' in name:
+                    encoder_params.append(param)
+                elif 'decoder' in name:
+                    decoder_params.append(param)
+
+        # Apply different scaling to encoder and decoder gradients
+        if self.model.peft_config.peft_type == "LORA":
+            # Scale encoder gradients more conservatively
+            for param in encoder_params:
+                param.grad.data = param.grad.data * 0.9
+            
+            # Scale decoder gradients more aggressively
+            for param in decoder_params:
+                param.grad.data = param.grad.data * 1.1
