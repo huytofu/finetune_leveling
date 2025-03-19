@@ -1,6 +1,6 @@
 from datasets import load_dataset
 import polars as pl
-from typing import Dict, List, Optional, Union, Any, Tuple
+from typing import Dict, List, Optional, Union, Any, Tuple, Callable
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
@@ -19,6 +19,9 @@ import threading
 from queue import Queue
 import ray
 from collections import defaultdict
+import hashlib
+import pickle
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +64,28 @@ class DatasetConfig:
     min_chunk_size: int = 100
     max_chunk_size: int = 10000
     monitoring_interval: float = 1.0  # seconds
+
+@dataclass
+class DataQualityMetrics:
+    """Metrics for data quality assessment."""
+    null_count: int = 0
+    duplicate_count: int = 0
+    invalid_format_count: int = 0
+    out_of_range_count: int = 0
+    total_samples: int = 0
+    validation_errors: List[str] = None
+
+    def __post_init__(self):
+        self.validation_errors = []
+
+    @property
+    def quality_score(self) -> float:
+        """Calculate overall quality score."""
+        if self.total_samples == 0:
+            return 0.0
+        error_rate = (self.null_count + self.duplicate_count + 
+                     self.invalid_format_count + self.out_of_range_count) / self.total_samples
+        return max(0.0, 1.0 - error_rate)
 
 class ParallelProcessingMonitor:
     """Monitor parallel processing performance."""
@@ -144,9 +169,136 @@ class AdaptiveBatchSizer:
             
         return int(self.current_size)
 
+class DataValidator:
+    """Validate dataset quality and schema."""
+    
+    def __init__(self, config: DatasetConfig):
+        self.config = config
+        self.metrics = defaultdict(DataQualityMetrics)
+        
+    def validate_schema(self, data: Dict[str, List], expected_schema: Dict[str, type]) -> bool:
+        """Validate data schema."""
+        try:
+            for key, expected_type in expected_schema.items():
+                if key not in data:
+                    raise ValueError(f"Missing required field: {key}")
+                if not all(isinstance(item, expected_type) for item in data[key]):
+                    raise ValueError(f"Invalid type for field {key}")
+            return True
+        except Exception as e:
+            logger.error(f"Schema validation failed: {e}")
+            return False
+            
+    def validate_data_quality(self, data: Dict[str, List], task_type: str) -> DataQualityMetrics:
+        """Validate data quality."""
+        metrics = DataQualityMetrics()
+        metrics.total_samples = len(next(iter(data.values())))
+        
+        try:
+            # Check for nulls
+            for key, values in data.items():
+                null_count = sum(1 for v in values if v is None or (isinstance(v, str) and not v.strip()))
+                metrics.null_count += null_count
+                
+            # Check for duplicates
+            if 'inputs' in data:
+                seen = set()
+                for input_text in data['inputs']:
+                    if input_text in seen:
+                        metrics.duplicate_count += 1
+                    seen.add(input_text)
+                    
+            # Task-specific validation
+            if task_type == "token_classification":
+                self._validate_token_classification(data, metrics)
+            elif task_type == "question_answering":
+                self._validate_qa(data, metrics)
+                
+            self.metrics[task_type] = metrics
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Data quality validation failed: {e}")
+            metrics.validation_errors.append(str(e))
+            return metrics
+            
+    def _validate_token_classification(self, data: Dict[str, List], metrics: DataQualityMetrics):
+        """Validate token classification data."""
+        if 'labels' in data:
+            for labels in data['labels']:
+                if not all(isinstance(l, int) for l in labels):
+                    metrics.invalid_format_count += 1
+                    
+    def _validate_qa(self, data: Dict[str, List], metrics: DataQualityMetrics):
+        """Validate question answering data."""
+        if 'answers' in data:
+            for answer in data['answers']:
+                if not isinstance(answer, dict) or 'text' not in answer:
+                    metrics.invalid_format_count += 1
+
+class CheckpointManager:
+    """Manage checkpoints for long-running processes."""
+    
+    def __init__(self, config: DatasetConfig):
+        self.config = config
+        self.checkpoint_dir = Path(config.cache_dir) / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+    def save_checkpoint(self, data: Any, task_type: str, step: int):
+        """Save processing checkpoint."""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            checkpoint_path = self.checkpoint_dir / f"{task_type}_{step}_{timestamp}.pkl"
+            
+            # Calculate data hash for integrity check
+            data_hash = hashlib.md5(pickle.dumps(data)).hexdigest()
+            
+            checkpoint_data = {
+                'data': data,
+                'hash': data_hash,
+                'step': step,
+                'timestamp': timestamp
+            }
+            
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+                
+            return checkpoint_path
+            
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            return None
+            
+    def load_checkpoint(self, task_type: str, step: Optional[int] = None) -> Optional[Dict]:
+        """Load latest checkpoint or specific step."""
+        try:
+            pattern = f"{task_type}_*.pkl" if step is None else f"{task_type}_{step}_*.pkl"
+            checkpoints = list(self.checkpoint_dir.glob(pattern))
+            
+            if not checkpoints:
+                return None
+                
+            latest_checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime)
+            
+            with open(latest_checkpoint, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+                
+            # Verify data integrity
+            loaded_hash = checkpoint_data['hash']
+            computed_hash = hashlib.md5(pickle.dumps(checkpoint_data['data'])).hexdigest()
+            
+            if loaded_hash != computed_hash:
+                raise ValueError("Checkpoint data corruption detected")
+                
+            return checkpoint_data
+            
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return None
+
 class DatasetModules:
     def __init__(self, dataset_dir: str, tokenizer: Any, specs: Dict[str, Any]):
-        """Initialize with enhanced parallel processing support."""
+        """Initialize with enhanced features."""
         try:
             self.dataset_dir = dataset_dir
             self.tokenizer = tokenizer
@@ -178,6 +330,14 @@ class DatasetModules:
             
             # Start monitoring
             self.monitor.start_monitoring()
+            
+            # Initialize new components
+            self.validator = DataValidator(self.config)
+            self.checkpoint_manager = CheckpointManager(self.config)
+            
+            # Define retry parameters
+            self.max_retries = specs.get('max_retries', 3)
+            self.retry_delay = specs.get('retry_delay', 1.0)
             
         except Exception as e:
             logger.error(f"Failed to initialize DatasetModules: {e}")
@@ -212,88 +372,101 @@ class DatasetModules:
             raise
 
     def _process_large_dataset(self, examples: Dict[str, List], processor_func: callable) -> Dict[str, List]:
-        """Process large datasets with enhanced parallel processing and monitoring."""
+        """Process large datasets with enhanced features."""
         try:
             start_time = time.time()
+            
+            # Validate input data
+            if not self.validator.validate_schema(examples, self._get_expected_schema()):
+                raise ValueError("Invalid input data schema")
+            
+            quality_metrics = self.validator.validate_data_quality(examples, self.task_type)
+            if quality_metrics.quality_score < 0.8:  # Configurable threshold
+                logger.warning(f"Low data quality score: {quality_metrics.quality_score}")
+            
+            # Process in chunks with checkpointing
             df = pl.DataFrame(examples)
-            
-            # Initialize processing queue and results
-            chunk_queue = Queue(maxsize=self.config.chunk_queue_size)
             results = []
+            current_pos = 0
             
-            def process_chunk(chunk_data):
-                """Process a single chunk with monitoring."""
-                chunk_start = time.time()
-                try:
-                    processed = processor_func(chunk_data.to_dict())
-                    chunk_time = time.time() - chunk_start
-                    self.monitor.update_metrics(
-                        self.task_type,
-                        chunk_time,
-                        len(chunk_data),
-                        success=True
-                    )
-                    return processed
-                except Exception as e:
-                    logger.error(f"Chunk processing failed: {e}")
-                    self.monitor.update_metrics(
-                        self.task_type,
-                        time.time() - chunk_start,
-                        len(chunk_data),
-                        success=False
-                    )
-                    return None
-
-            # Process chunks in parallel
-            with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-                futures = []
-                current_pos = 0
+            while current_pos < len(df):
+                # Load checkpoint if exists
+                checkpoint = self.checkpoint_manager.load_checkpoint(self.task_type, current_pos)
+                if checkpoint:
+                    results.extend(checkpoint['data'])
+                    current_pos = checkpoint['step'] + self.config.batch_size
+                    continue
                 
-                while current_pos < len(df):
-                    # Get adaptive batch size
-                    metrics = self.monitor.get_metrics(self.task_type)
-                    chunk_size = self.batch_sizer.update(
-                        metrics['avg_chunk_time'],
-                        metrics['memory_usage']
-                    )
-                    
-                    # Process chunk
-                    chunk = df.slice(current_pos, chunk_size)
-                    future = executor.submit(process_chunk, chunk)
-                    futures.append(future)
-                    current_pos += chunk_size
-                    
-                    # Log progress
-                    if current_pos % (chunk_size * 10) == 0:
-                        logger.info(f"Processing progress: {current_pos}/{len(df)} examples")
-                        logger.info(f"Current metrics: {metrics}")
+                # Process chunk with retry mechanism
+                chunk = df.slice(current_pos, self.config.batch_size)
+                processed_chunk = self._process_with_retry(processor_func, chunk.to_dict())
+                results.append(processed_chunk)
                 
-                # Collect results
-                results = []
-                for future in tqdm(futures, desc="Collecting results"):
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            results.append(result)
-                    except Exception as e:
-                        logger.error(f"Failed to get result: {e}")
+                # Save checkpoint
+                self.checkpoint_manager.save_checkpoint(results, self.task_type, current_pos)
+                current_pos += self.config.batch_size
             
-            # Combine results
-            combined = {}
-            for key in results[0].keys():
-                combined[key] = [item for chunk in results for item in chunk[key]]
-            
-            # Update final metrics
-            total_time = time.time() - start_time
-            logger.info(f"Total processing time: {total_time:.2f}s")
-            logger.info(f"Final metrics: {self.monitor.get_metrics(self.task_type)}")
+            # Combine and validate results
+            combined = self._combine_results(results)
+            if not self.validator.validate_schema(combined, self._get_expected_schema()):
+                raise ValueError("Invalid output data schema")
             
             return combined
             
         except Exception as e:
             logger.error(f"Error in large dataset processing: {e}")
             raise
+
+    def _get_expected_schema(self) -> Dict[str, type]:
+        """Get expected schema based on task type."""
+        base_schema = {
+            'inputs': str,
+            'attention_mask': list
+        }
         
+        task_schemas = {
+            'token_classification': {'labels': list},
+            'question_answering': {
+                'question': str,
+                'context': str,
+                'answers': dict
+            }
+        }
+        
+        return {**base_schema, **(task_schemas.get(self.task_type, {}))}
+
+    def _combine_results(self, results: List[Dict[str, List]]) -> Dict[str, List]:
+        """Combine results with validation."""
+        try:
+            combined = {}
+            for key in results[0].keys():
+                combined[key] = []
+                for result in results:
+                    if key not in result:
+                        raise KeyError(f"Missing key {key} in result")
+                    combined[key].extend(result[key])
+            return combined
+        except Exception as e:
+            logger.error(f"Failed to combine results: {e}")
+            raise
+
+    def _process_with_retry(self, processor_func: Callable, data: Any, max_retries: int = None) -> Any:
+        """Process data with retry mechanism."""
+        retries = 0
+        max_retries = max_retries or self.max_retries
+        
+        while retries < max_retries:
+            try:
+                result = processor_func(data)
+                return result
+            except Exception as e:
+                retries += 1
+                if retries == max_retries:
+                    logger.error(f"Processing failed after {max_retries} retries: {e}")
+                    raise
+                logger.warning(f"Retry {retries}/{max_retries} after error: {e}")
+                time.sleep(self.retry_delay * retries)
+
     def __del__(self):
         """Cleanup monitoring resources."""
         self.monitor.stop_monitoring()
