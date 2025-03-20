@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Third-party imports
 import evaluate
@@ -61,6 +61,7 @@ from configs.default_config import DEFAULT_SPECS
 from dataset_modules import DatasetModules
 from model_modules import ModelModules
 from tokenizer_modules import TokenizerModules
+from distributed_manager import DistributedManager, DistributedConfig, DistributedBackend
 
 class MLflowCallback:
     """Callback for tracking training metrics in MLflow."""
@@ -405,11 +406,38 @@ class InferencePipeLine():
 
 class FineTunePipeLine():
     def __init__(self, args_dir: str, specs: Dict[str, Any] = None):
-        """Initialize the finetuning pipeline with MLflow tracking."""
+        """Initialize the finetuning pipeline with MLflow tracking and distributed training support."""
         self.specs = {**DEFAULT_SPECS, **(specs or {})}
         self.args_dir = args_dir
         
-        # Initialize MLflow tracking
+        # Initialize distributed training
+        self.distributed_config = DistributedConfig(
+            backend=DistributedBackend(self.specs.get("distributed_backend", "ddp")),
+            world_size=self.specs.get("world_size", 1),
+            rank=self.specs.get("rank", 0),
+            local_rank=self.specs.get("local_rank", 0),
+            master_addr=self.specs.get("master_addr", "localhost"),
+            master_port=self.specs.get("master_port", "12355")
+        )
+        self.distributed_manager = DistributedManager(
+            config=self.distributed_config,
+            specs=self.specs
+        )
+        
+        # Initialize MLflow tracking only on main process
+        if self.distributed_manager.is_main_process():
+            self._setup_mlflow()
+        
+        # Initialize components
+        self.model_modules = ModelModules(self.specs)
+        self.tokenizer_modules = TokenizerModules(self.specs)
+        self.dataset_modules = DatasetModules(self.specs.get("dataset_dir"), self.tokenizer_modules.tokenizer, self.specs)
+        
+        # Load configurations
+        self._load_configs()
+        
+    def _setup_mlflow(self):
+        """Setup MLflow tracking."""
         self.experiment_name = self.specs.get("experiment_name", "default_experiment")
         self.tracking_uri = self.specs.get("tracking_uri", "sqlite:///mlflow.db")
         
@@ -425,14 +453,6 @@ class FineTunePipeLine():
         mlflow.log_param("task_type", self.specs.get("task_type", "unknown"))
         mlflow.log_param("model_name", self.specs.get("model_name", "unknown"))
         mlflow.log_param("data_source", self.specs.get("data_source", "unknown"))
-        
-        # Initialize components
-        self.model_modules = ModelModules(self.specs)
-        self.tokenizer_modules = TokenizerModules(self.specs)
-        self.dataset_modules = DatasetModules(self.specs.get("dataset_dir"), self.tokenizer_modules.tokenizer, self.specs)
-        
-        # Load configurations
-        self._load_configs()
         
     def _load_configs(self):
         """Load configurations from args directory."""
@@ -505,28 +525,49 @@ class FineTunePipeLine():
             raise
             
     def run(self):
-        """Run the finetuning pipeline with MLflow tracking."""
+        """Run the finetuning pipeline with distributed training and MLflow tracking."""
         try:
             start_time = time.time()
             
+            # Initialize distributed training
+            self.distributed_manager.initialize()
+            
             # Prepare model
-            logging.info("Preparing model...")
+            if self.distributed_manager.is_main_process():
+                logging.info("Preparing model...")
             self.model_modules.prepare_model()
             
+            # Wrap model for distributed training
+            self.model_modules.model = self.distributed_manager.wrap_model(self.model_modules.model)
+            
             # Prepare optimizer
-            logging.info("Preparing optimizer...")
+            if self.distributed_manager.is_main_process():
+                logging.info("Preparing optimizer...")
             optimizer = self.prepare_optimizer()
             
             # Prepare data collator
-            logging.info("Preparing data collator...")
+            if self.distributed_manager.is_main_process():
+                logging.info("Preparing data collator...")
             data_collator = self.prepare_data_collator()
             
             # Prepare dataset
-            logging.info("Preparing dataset...")
+            if self.distributed_manager.is_main_process():
+                logging.info("Preparing dataset...")
             dataset = self.dataset_modules.prepare_dataset_from_dir(self.specs.get("task_type"))
             
+            # Get distributed dataloaders
+            train_dataloader = self.distributed_manager.get_dataloader(
+                dataset["train"],
+                batch_size=self.specs.get("per_device_train_batch_size", 8)
+            )
+            eval_dataloader = self.distributed_manager.get_dataloader(
+                dataset["eval"],
+                batch_size=self.specs.get("per_device_eval_batch_size", 8)
+            )
+            
             # Initialize trainer with MLflow callback
-            logging.info("Initializing trainer...")
+            if self.distributed_manager.is_main_process():
+                logging.info("Initializing trainer...")
             trainer_class = self._get_trainer_class()
             trainer = trainer_class(
                 model=self.model_modules.model,
@@ -535,35 +576,41 @@ class FineTunePipeLine():
                 eval_dataset=dataset["eval"],
                 data_collator=data_collator,
                 optimizers=(optimizer, None),
-                callbacks=[MLflowCallback(self.run_id)]
+                callbacks=[MLflowCallback(self.run_id)] if self.distributed_manager.is_main_process() else None
             )
             
             # Train the model
-            logging.info("Starting training...")
+            if self.distributed_manager.is_main_process():
+                logging.info("Starting training...")
             trainer.train()
             
-            # Save the model
-            logging.info("Saving model...")
-            trainer.save_model()
-            
-            # Log final metrics
-            total_duration = time.time() - start_time
-            mlflow.log_metric("total_training_duration", total_duration)
-            mlflow.log_param("end_time", datetime.now().isoformat())
-            
-            # Log model artifacts
-            model_path = os.path.join(self.training_args.get("output_dir", "output"), "final_model")
-            if os.path.exists(model_path):
-                mlflow.log_artifact(model_path, "final_model")
+            # Save the model only on main process
+            if self.distributed_manager.is_main_process():
+                logging.info("Saving model...")
+                trainer.save_model()
                 
-            # End MLflow run
-            mlflow.end_run()
+                # Log final metrics
+                total_duration = time.time() - start_time
+                mlflow.log_metric("total_training_duration", total_duration)
+                mlflow.log_param("end_time", datetime.now().isoformat())
+                
+                # Log model artifacts
+                model_path = os.path.join(self.training_args.get("output_dir", "output"), "final_model")
+                if os.path.exists(model_path):
+                    mlflow.log_artifact(model_path, "final_model")
+                    
+                # End MLflow run
+                mlflow.end_run()
+            
+            # Cleanup distributed training
+            self.distributed_manager.cleanup()
             
         except Exception as e:
-            logging.error(f"Error in pipeline execution: {e}")
-            mlflow.end_run(status="FAILED")
+            if self.distributed_manager.is_main_process():
+                logging.error(f"Error in pipeline execution: {e}")
+                mlflow.end_run(status="FAILED")
             raise
-            
+
     def _get_trainer_class(self):
         """Get appropriate trainer class based on task type."""
         task_type = self.specs.get("task_type", "unknown")
