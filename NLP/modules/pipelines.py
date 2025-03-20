@@ -14,6 +14,9 @@ from transformers import (
     DataCollatorForSeq2Seq,
     default_data_collator
 )
+import time
+import mlflow
+from datetime import datetime
 
 currdir = os.path.dirname(os.path.abspath(__file__))
 parentdir = os.path.dirname(currdir)
@@ -399,6 +402,21 @@ class FineTunePipeLine():
             print(f"Error loading specs: {e}")
             self.specs = DEFAULT_SPECS
 
+    def _get_trainer_class(self):
+        """Get the appropriate trainer class based on configuration."""
+        if self.use_lightning:
+            if self.specs.get("task_type") == "seq2seq":
+                return AcceleratedNLPSeq2SeqTrainerWithLightning
+            return AcceleratedNLPTrainerWithLightning
+        elif self.use_accelerate:
+            if self.specs.get("task_type") == "seq2seq":
+                return AcceleratedNLPSeq2SeqTrainer
+            return AcceleratedNLPTrainer
+        else:
+            if self.specs.get("task_type") == "seq2seq":
+                return NLPSeq2SeqTrainer
+            return NLPTrainer
+
     def run(self):
         """Run the fine-tuning pipeline."""
         # Load model and tokenizer with appropriate quantization
@@ -517,7 +535,7 @@ class FineTunePipeLine():
         self.save_model_and_checkpoint(model, tokenizer, trainer)
         
         return model, tokenizer
-    
+
     def save_model_and_checkpoint(self, model, tokenizer, trainer):
         """Save the model, tokenizer, and create a checkpoint."""
         output_dir = self.specs["output_dir"]
