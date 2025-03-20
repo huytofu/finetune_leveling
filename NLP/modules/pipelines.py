@@ -62,6 +62,7 @@ from dataset_modules import DatasetModules
 from model_modules import ModelModules
 from tokenizer_modules import TokenizerModules
 from distributed_manager import DistributedManager, DistributedConfig, DistributedBackend
+from .error_handler import ErrorHandler
 
 class MLflowCallback:
     """Callback for tracking training metrics in MLflow."""
@@ -405,225 +406,111 @@ class InferencePipeLine():
         return self.adapter_manager.list_adapters()[0]['id']
 
 class FineTunePipeLine():
-    def __init__(self, args_dir: str, specs: Dict[str, Any] = None):
-        """Initialize the finetuning pipeline with MLflow tracking and distributed training support."""
-        self.specs = {**DEFAULT_SPECS, **(specs or {})}
+    def __init__(self, args_dir, task_type,
+                chosen_metric=None, quantization=None,
+                peft_method=None, peft_config=None, use_lightning=False, use_accelerate=False):
+        """
+        Initialize the fine-tuning pipeline.
+        
+        Args:
+            args_dir: Directory containing configuration arguments
+            task_type: Type of task (e.g., masked_language_modeling, token_classification)
+            chosen_metric: Metric to use for evaluation
+            quantization: Quantization configuration
+            peft_method: PEFT method to use
+            peft_config: PEFT configuration
+            use_lightning: Whether to use PyTorch Lightning
+            use_accelerate: Whether to use Hugging Face Accelerate
+        """
         self.args_dir = args_dir
+        self.task_type = task_type
+        self.specs = {**DEFAULT_SPECS}
+        if args_dir is not None:
+            try:
+                with open(args_dir, 'r') as f:
+                    user_config = json.load(f)
+                self.specs.update(user_config)
+            except FileNotFoundError:
+                ErrorHandler.handle_error("IO_ERROR", f"Configuration file not found: {args_dir}")
+            except json.JSONDecodeError:
+                ErrorHandler.handle_error("CONFIG_ERROR", f"Invalid JSON in configuration file: {args_dir}")
         
-        # Initialize distributed training
-        self.distributed_config = DistributedConfig(
-            backend=DistributedBackend(self.specs.get("distributed_backend", "ddp")),
-            world_size=self.specs.get("world_size", 1),
-            rank=self.specs.get("rank", 0),
-            local_rank=self.specs.get("local_rank", 0),
-            master_addr=self.specs.get("master_addr", "localhost"),
-            master_port=self.specs.get("master_port", "12355")
-        )
-        self.distributed_manager = DistributedManager(
-            config=self.distributed_config,
-            specs=self.specs
-        )
+        self.chosen_metric = chosen_metric
+        self.quantization = quantization
+        self.peft_method = peft_method
+        self.peft_config = peft_config
+        self.use_lightning = use_lightning
+        self.use_accelerate = use_accelerate
         
-        # Initialize MLflow tracking only on main process
-        if self.distributed_manager.is_main_process():
+        # Setup MLflow if enabled
+        self.use_mlflow = self.specs.get("use_mlflow", False)
+        if self.use_mlflow:
             self._setup_mlflow()
         
-        # Initialize components
-        self.model_modules = ModelModules(self.specs)
-        self.tokenizer_modules = TokenizerModules(self.specs)
-        self.dataset_modules = DatasetModules(self.specs.get("dataset_dir"), self.tokenizer_modules.tokenizer, self.specs)
-        
-        # Load configurations
-        self._load_configs()
-        
+        # Initialize managers and modules
+        try:
+            self.checkpoint_manager = CheckpointManager(
+                base_dir=self.specs.get("output_dir", "checkpoints"),
+                max_checkpoints=self.specs.get("max_checkpoints", 3)
+            )
+            
+            if self.quantization:
+                self.quantization_manager = QuantizationManager()
+                
+            self.type_utils = TypeUtils()
+            
+            # Initialize model and tokenizer modules
+            logger.info("Initializing model and tokenizer modules")
+            self.model_modules = ModelModules(self.specs)
+            self.tokenizer_modules = TokenizerModules(self.specs)
+            
+            # Initialize dataset modules
+            logger.info("Initializing dataset modules")
+            self.dataset_modules = DatasetModules(
+                self.specs.get("dataset_dir"), 
+                self.tokenizer_modules.load_tokenizer(), 
+                self.specs
+            )
+            
+            # Determine trainer class
+            self.trainer_class = self._get_trainer_class()
+            
+        except Exception as e:
+            ErrorHandler.handle_error("TRAINING_ERROR", str(e))
+            raise
+
     def _setup_mlflow(self):
         """Setup MLflow tracking."""
         self.experiment_name = self.specs.get("experiment_name", "default_experiment")
         self.tracking_uri = self.specs.get("tracking_uri", "sqlite:///mlflow.db")
         
-        mlflow.set_tracking_uri(self.tracking_uri)
-        mlflow.set_experiment(self.experiment_name)
-        
-        # Start MLflow run
-        self.run = mlflow.start_run(run_name=f"finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        self.run_id = self.run.info.run_id
-        
-        # Log initial metadata
-        mlflow.log_param("start_time", datetime.now().isoformat())
-        mlflow.log_param("task_type", self.specs.get("task_type", "unknown"))
-        mlflow.log_param("model_name", self.specs.get("model_name", "unknown"))
-        mlflow.log_param("data_source", self.specs.get("data_source", "unknown"))
-        
-    def _load_configs(self):
-        """Load configurations from args directory."""
         try:
-            # Load training arguments
-            with open(os.path.join(self.args_dir, "training_args.json"), "r") as f:
-                self.training_args = json.load(f)
-                
-            # Load model arguments
-            with open(os.path.join(self.args_dir, "model_args.json"), "r") as f:
-                self.model_args = json.load(f)
-                
-            # Log configurations to MLflow
-            mlflow.log_dict(self.training_args, "training_args.json")
-            mlflow.log_dict(self.model_args, "model_args.json")
+            # Set tracking URI and experiment
+            mlflow.set_tracking_uri(self.tracking_uri)
+            mlflow.set_experiment(self.experiment_name)
             
+            # Start MLflow run
+            run_name = f"finetune_{self.task_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.run = mlflow.start_run(run_name=run_name)
+            self.run_id = self.run.info.run_id
+            
+            # Log initial metadata
+            mlflow.log_param("start_time", datetime.now().isoformat())
+            mlflow.log_param("task_type", self.task_type)
+            mlflow.log_param("model_name", self.specs.get("model_name", "unknown"))
+            mlflow.log_param("data_source", self.specs.get("dataset_dir", "unknown"))
+            mlflow.log_param("quantization", self.quantization)
+            mlflow.log_param("peft_method", self.peft_method)
+            mlflow.log_param("use_lightning", self.use_lightning)
+            mlflow.log_param("use_accelerate", self.use_accelerate)
+            
+            # Log specifications
+            mlflow.log_dict(self.specs, "specs.json")
+            
+            logger.info(f"MLflow tracking initialized. Run ID: {self.run_id}")
         except Exception as e:
-            logging.error(f"Failed to load configurations: {e}")
-            raise
-            
-    def prepare_optimizer(self):
-        """Prepare optimizer with MLflow tracking."""
-        try:
-            optimizer = AdamW(
-                self.model_modules.model.parameters(),
-                lr=self.training_args.get("learning_rate", 2e-5),
-                weight_decay=self.training_args.get("weight_decay", 0.01)
-            )
-            
-            # Log optimizer configuration
-            mlflow.log_param("optimizer_type", "AdamW")
-            mlflow.log_param("learning_rate", self.training_args.get("learning_rate", 2e-5))
-            mlflow.log_param("weight_decay", self.training_args.get("weight_decay", 0.01))
-            
-            return optimizer
-            
-        except Exception as e:
-            logging.error(f"Failed to prepare optimizer: {e}")
-            raise
-            
-    def prepare_data_collator(self):
-        """Prepare data collator with MLflow tracking."""
-        try:
-            task_type = self.specs.get("task_type", "unknown")
-            
-            if task_type == "masked_language_modeling":
-                collator = DataCollatorForLanguageModeling(
-                    tokenizer=self.tokenizer_modules.tokenizer,
-                    mlm=True,
-                    mlm_probability=0.15
-                )
-            elif task_type == "token_classification":
-                collator = DataCollatorForTokenClassification(
-                    tokenizer=self.tokenizer_modules.tokenizer
-                )
-            elif task_type in ["translation", "summarization"]:
-                collator = DataCollatorForSeq2Seq(
-                    tokenizer=self.tokenizer_modules.tokenizer
-                )
-            else:
-                collator = default_data_collator
-                
-            # Log collator configuration
-            mlflow.log_param("data_collator_type", collator.__class__.__name__)
-            
-            return collator
-            
-        except Exception as e:
-            logging.error(f"Failed to prepare data collator: {e}")
-            raise
-            
-    def run(self):
-        """Run the finetuning pipeline with distributed training and MLflow tracking."""
-        try:
-            start_time = time.time()
-            
-            # Initialize distributed training
-            self.distributed_manager.initialize()
-            
-            # Prepare model
-            if self.distributed_manager.is_main_process():
-                logging.info("Preparing model...")
-            self.model_modules.prepare_model()
-            
-            # Wrap model for distributed training
-            self.model_modules.model = self.distributed_manager.wrap_model(self.model_modules.model)
-            
-            # Prepare optimizer
-            if self.distributed_manager.is_main_process():
-                logging.info("Preparing optimizer...")
-            optimizer = self.prepare_optimizer()
-            
-            # Prepare data collator
-            if self.distributed_manager.is_main_process():
-                logging.info("Preparing data collator...")
-            data_collator = self.prepare_data_collator()
-            
-            # Prepare dataset
-            if self.distributed_manager.is_main_process():
-                logging.info("Preparing dataset...")
-            dataset = self.dataset_modules.prepare_dataset_from_dir(self.specs.get("task_type"))
-            
-            # Get distributed dataloaders
-            train_dataloader = self.distributed_manager.get_dataloader(
-                dataset["train"],
-                batch_size=self.specs.get("per_device_train_batch_size", 8)
-            )
-            eval_dataloader = self.distributed_manager.get_dataloader(
-                dataset["eval"],
-                batch_size=self.specs.get("per_device_eval_batch_size", 8)
-            )
-            
-            # Initialize trainer with MLflow callback
-            if self.distributed_manager.is_main_process():
-                logging.info("Initializing trainer...")
-            trainer_class = self._get_trainer_class()
-            trainer = trainer_class(
-                model=self.model_modules.model,
-                args=self.training_args,
-                train_dataset=dataset["train"],
-                eval_dataset=dataset["eval"],
-                data_collator=data_collator,
-                optimizers=(optimizer, None),
-                callbacks=[MLflowCallback(self.run_id)] if self.distributed_manager.is_main_process() else None
-            )
-            
-            # Train the model
-            if self.distributed_manager.is_main_process():
-                logging.info("Starting training...")
-            trainer.train()
-            
-            # Save the model only on main process
-            if self.distributed_manager.is_main_process():
-                logging.info("Saving model...")
-                trainer.save_model()
-                
-                # Log final metrics
-                total_duration = time.time() - start_time
-                mlflow.log_metric("total_training_duration", total_duration)
-                mlflow.log_param("end_time", datetime.now().isoformat())
-                
-                # Log model artifacts
-                model_path = os.path.join(self.training_args.get("output_dir", "output"), "final_model")
-                if os.path.exists(model_path):
-                    mlflow.log_artifact(model_path, "final_model")
-                    
-                # End MLflow run
-                mlflow.end_run()
-            
-            # Cleanup distributed training
-            self.distributed_manager.cleanup()
-            
-        except Exception as e:
-            if self.distributed_manager.is_main_process():
-                logging.error(f"Error in pipeline execution: {e}")
-                mlflow.end_run(status="FAILED")
-            raise
-
-    def _get_trainer_class(self):
-        """Get appropriate trainer class based on task type."""
-        task_type = self.specs.get("task_type", "unknown")
-        use_lightning = self.specs.get("use_lightning", False)
-        
-        if task_type in ["translation", "summarization"]:
-            if use_lightning:
-                return AcceleratedNLPSeq2SeqTrainerWithLightning
-            return AcceleratedNLPSeq2SeqTrainer
-        else:
-            if use_lightning:
-                return AcceleratedNLPTrainerWithLightning
-            return AcceleratedNLPTrainer
+            logger.warning(f"Failed to initialize MLflow tracking: {e}")
+            self.use_mlflow = False
 
     def _prepare_fallback_optimizer(self, model):
         """
@@ -635,11 +522,15 @@ class FineTunePipeLine():
         Returns:
             The prepared optimizer
         """
-        return AdamW(
-            model.parameters(),
-            lr=self.specs['learning_rate'],
-            weight_decay=self.specs['weight_decay']
-        )
+        try:
+            return AdamW(
+                model.parameters(),
+                lr=self.specs['learning_rate'],
+                weight_decay=self.specs['weight_decay']
+            )
+        except Exception as e:
+            ErrorHandler.handle_error("TRAINING_ERROR", f"Failed to create optimizer: {str(e)}")
+            return None
 
     def _prepare_fallback_data_collator(self, tokenizer, model=None):
         """
@@ -652,164 +543,219 @@ class FineTunePipeLine():
         Returns:
             The prepared data collator
         """
-        if self.task_type == "masked_language_modeling":
-            return DataCollatorForLanguageModeling(
-                tokenizer=tokenizer,
-                mlm_probability=self.specs['mlm_probability']
-            )
-        elif self.task_type == "token_classification":
-            return DataCollatorForTokenClassification(tokenizer=tokenizer)
-        elif self.task_type in ["translation", "summarization", "text_generation"]:
-            return DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
-        elif self.task_type == "question_answering":
-            return default_data_collator
-        else:
-            raise ValueError(f"Unsupported task type: {self.task_type}")
-
-    def load_specs(self):
-        """Load specifications from the arguments file."""
-        import json
-        from configs.default_config import DEFAULT_SPECS
         try:
-            specs = json.load(open(self.args_dir, 'r'))
-            self.specs = {**DEFAULT_SPECS, **specs}
+            if self.task_type == "masked_language_modeling":
+                return DataCollatorForLanguageModeling(
+                    tokenizer=tokenizer,
+                    mlm_probability=self.specs['mlm_probability']
+                )
+            elif self.task_type == "token_classification":
+                return DataCollatorForTokenClassification(tokenizer=tokenizer)
+            elif self.task_type in ["translation", "summarization", "text_generation"]:
+                return DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+            elif self.task_type == "question_answering":
+                return default_data_collator
+            else:
+                ErrorHandler.handle_error("TASK_TYPE_ERROR", self.task_type)
+                return default_data_collator
         except Exception as e:
-            print(f"Error loading specs: {e}")
-            self.specs = DEFAULT_SPECS
+            ErrorHandler.handle_error("TRAINING_ERROR", f"Failed to create data collator: {str(e)}")
+            return default_data_collator
 
     def _get_trainer_class(self):
         """Get the appropriate trainer class based on configuration."""
         if self.use_lightning:
-            if self.specs.get("task_type") == "seq2seq":
+            if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
                 return AcceleratedNLPSeq2SeqTrainerWithLightning
             return AcceleratedNLPTrainerWithLightning
         elif self.use_accelerate:
-            if self.specs.get("task_type") == "seq2seq":
+            if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
                 return AcceleratedNLPSeq2SeqTrainer
             return AcceleratedNLPTrainer
         else:
-            if self.specs.get("task_type") == "seq2seq":
+            if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
                 return NLPSeq2SeqTrainer
             return NLPTrainer
 
     def run(self):
         """Run the fine-tuning pipeline."""
-        # Load model and tokenizer with appropriate quantization
-        model_kwargs = {}
-        if self.quantization:
-            model_kwargs = self.quantization_manager.prepare_model_for_quantization(
-                model_name_or_path=self.specs.get("model_name_or_path", ""),
-                quant_type=self.quantization,
-                custom_quantization_config=self.specs.get("quantization_config", None)
-            )
-            
-        model = self.model_modules.load_model(self.task_type, model_kwargs)
-        tokenizer = self.tokenizer_modules.load_tokenizer()
+        logger.info(f"Starting fine-tuning for task: {self.task_type}")
+        start_time = time.time()
         
-        # Optimize memory layout
-        model = self.type_utils.optimize_memory_layout(model, self.peft_method)
-        
-        # Apply PEFT if specified
-        if self.peft_method:
-            # Check compatibility with quantization
+        try:
+            # Load model and tokenizer with appropriate quantization
+            model_kwargs = {}
             if self.quantization:
-                is_compatible, reason = self.quantization_manager.check_peft_compatible(
-                    model, self.peft_method
-                )
-                if not is_compatible:
-                    print(f"Warning: {reason}")
-                
-                # Optimize for PEFT with quantization
-                model = self.quantization_manager.optimize_model_for_peft(
-                    model, self.quantization, self.peft_method
+                logger.info(f"Preparing model for quantization: {self.quantization}")
+                model_kwargs = self.quantization_manager.prepare_model_for_quantization(
+                    model_name_or_path=self.specs.get("model_name_or_path", ""),
+                    quant_type=self.quantization,
+                    custom_quantization_config=self.specs.get("quantization_config", None)
                 )
                 
-            model, tokenizer = self.model_modules.apply_peft(
-                model=model,
-                tokenizer=tokenizer,
-                peft_method=self.peft_method,
-                peft_config=self.peft_config,
-                task_type=self.task_type
-            )
+            # Load model
+            logger.info("Loading model")
+            model = self.model_modules.load_model(self.task_type, model_kwargs)
             
-            # Validate parameter types
-            self.type_utils.check_parameter_types(model)
-        
-        # Load dataset
-        raw_dataset = self.dataset_modules.load_dataset()
-        
-        # Preprocess dataset based on task type
-        if self.task_type == "masked_language_modeling":
-            train_dataset, eval_dataset = self.dataset_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
-        elif self.task_type == "token_classification":
-            train_dataset, eval_dataset = self.dataset_modules.prepare_token_classification(raw_dataset, tokenizer, self.specs)
-        elif self.task_type == "translation":
-            train_dataset, eval_dataset = self.dataset_modules.prepare_translation(raw_dataset, tokenizer, self.specs)
-        elif self.task_type == "summarization":
-            train_dataset, eval_dataset = self.dataset_modules.prepare_summarization(raw_dataset, tokenizer, self.specs)
-        elif self.task_type == "text_generation":
-            train_dataset, eval_dataset = self.dataset_modules.prepare_text_generation(raw_dataset, tokenizer, self.specs)
-        elif self.task_type == "question_answering":
-            train_dataset, eval_dataset = self.dataset_modules.prepare_question_answering(raw_dataset, tokenizer, self.specs)
-        else:
-            train_dataset, eval_dataset = None, None
-        
-        # Setup additional callbacks for Lightning
-        callbacks = []
-        if self.use_lightning and self.peft_method:
-            # Add PEFT-specific callbacks
-            peft_monitor = PeftAdapterMonitorCallback(
-                monitor_gradients=True,
-                monitor_weights=True,
-                log_every_n_steps=100,
-                save_path=os.path.join(self.specs["output_dir"], "peft_monitoring")
-            )
-            callbacks.append(peft_monitor)
+            # Load tokenizer
+            logger.info("Loading tokenizer")
+            tokenizer = self.tokenizer_modules.load_tokenizer()
             
-            # Only add pruning if enabled in specs
-            if self.specs.get("peft_pruning_enabled", False):
-                peft_pruning = PeftEarlyPruningCallback(
-                    start_pruning_epoch=1,
-                    pruning_threshold=self.specs.get("peft_pruning_threshold", 0.01),
-                    final_sparsity=self.specs.get("peft_pruning_sparsity", 0.3)
+            # Optimize memory layout
+            logger.info("Optimizing memory layout")
+            model = self.type_utils.optimize_memory_layout(model, self.peft_method)
+            
+            # Apply PEFT if specified
+            if self.peft_method:
+                logger.info(f"Applying PEFT method: {self.peft_method}")
+                
+                # Check compatibility with quantization
+                if self.quantization:
+                    is_compatible, reason = self.quantization_manager.check_peft_compatible(
+                        model, self.peft_method
+                    )
+                    if not is_compatible:
+                        logger.warning(f"Warning: {reason}")
+                    
+                    # Optimize for PEFT with quantization
+                    model = self.quantization_manager.optimize_model_for_peft(
+                        model, self.quantization, self.peft_method
+                    )
+                    
+                model, tokenizer = self.model_modules.apply_peft(
+                    model=model,
+                    tokenizer=tokenizer,
+                    peft_method=self.peft_method,
+                    peft_config=self.peft_config,
+                    task_type=self.task_type
                 )
-                callbacks.append(peft_pruning)
-        
-        # Prepare fallback optimizer and data collator
-        fallback_optimizer = self._prepare_fallback_optimizer(model)
-        fallback_data_collator = self._prepare_fallback_data_collator(tokenizer, model)
-        
-        # Initialize the trainer
-        trainer_kwargs = {
-            "args_dir": self.args_dir,
-            "model": model,
-            "tokenizer": tokenizer,
-            "train_dataset": train_dataset,
-            "eval_dataset": eval_dataset,
-            "raw_dataset": raw_dataset,
-            "task_type": self.task_type,
-            "chosen_metric": self.chosen_metric,
-            "specs": self.specs,
-            "fallback_optimizer": fallback_optimizer,
-            "fallback_data_collator": fallback_data_collator
-        }
-        
-        # Add callbacks for Lightning trainers
-        if self.use_lightning and callbacks:
-            trainer_kwargs["callbacks"] = callbacks
-        
-        trainer = self.trainer_class(**trainer_kwargs)
-        
-        # Run the training process
-        if self.use_lightning:
-            trainer.fit()
-        else:
-            trainer.train()
-        
-        # Save model and checkpoint
-        self.save_model_and_checkpoint(model, tokenizer, trainer)
-        
-        return model, tokenizer
+                
+                # Validate parameter types
+                self.type_utils.check_parameter_types(model)
+            
+            # Load dataset
+            logger.info("Loading dataset")
+            raw_dataset = self.dataset_modules.load_dataset()
+            
+            # Preprocess dataset based on task type
+            logger.info("Preprocessing dataset")
+            if self.task_type == "masked_language_modeling":
+                train_dataset, eval_dataset = self.dataset_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
+            elif self.task_type == "token_classification":
+                train_dataset, eval_dataset = self.dataset_modules.prepare_token_classification(raw_dataset, tokenizer, self.specs)
+            elif self.task_type == "translation":
+                train_dataset, eval_dataset = self.dataset_modules.prepare_translation(raw_dataset, tokenizer, self.specs)
+            elif self.task_type == "summarization":
+                train_dataset, eval_dataset = self.dataset_modules.prepare_summarization(raw_dataset, tokenizer, self.specs)
+            elif self.task_type == "text_generation":
+                train_dataset, eval_dataset = self.dataset_modules.prepare_text_generation(raw_dataset, tokenizer, self.specs)
+            elif self.task_type == "question_answering":
+                train_dataset, eval_dataset = self.dataset_modules.prepare_question_answering(raw_dataset, tokenizer, self.specs)
+            else:
+                ErrorHandler.handle_error("TASK_TYPE_ERROR", self.task_type)
+                return None, None
+            
+            # Log dataset information if MLflow is enabled
+            if self.use_mlflow:
+                mlflow.log_param("train_dataset_size", len(train_dataset))
+                mlflow.log_param("eval_dataset_size", len(eval_dataset))
+            
+            # Setup callbacks
+            callbacks = []
+            
+            # Add MLflow callback if enabled
+            if self.use_mlflow and hasattr(self, 'run_id'):
+                logger.info("Adding MLflow callback")
+                mlflow_callback = MLflowCallback(self.run_id)
+                callbacks.append(mlflow_callback)
+            
+            # Add PEFT-specific callbacks for Lightning
+            if self.use_lightning and self.peft_method:
+                # Add PEFT monitoring callback
+                logger.info("Setting up PEFT monitoring callbacks")
+                peft_monitor = PeftAdapterMonitorCallback(
+                    monitor_gradients=True,
+                    monitor_weights=True,
+                    log_every_n_steps=100,
+                    save_path=os.path.join(self.specs["output_dir"], "peft_monitoring")
+                )
+                callbacks.append(peft_monitor)
+                
+                # Only add pruning if enabled in specs
+                if self.specs.get("peft_pruning_enabled", False):
+                    logger.info("Setting up PEFT pruning callback")
+                    peft_pruning = PeftEarlyPruningCallback(
+                        start_pruning_epoch=1,
+                        pruning_threshold=self.specs.get("peft_pruning_threshold", 0.01),
+                        final_sparsity=self.specs.get("peft_pruning_sparsity", 0.3)
+                    )
+                    callbacks.append(peft_pruning)
+            
+            # Prepare fallback optimizer and data collator
+            logger.info("Preparing optimizer and data collator")
+            fallback_optimizer = self._prepare_fallback_optimizer(model)
+            fallback_data_collator = self._prepare_fallback_data_collator(tokenizer, model)
+            
+            # Initialize the trainer
+            logger.info(f"Initializing trainer: {self.trainer_class.__name__}")
+            trainer_kwargs = {
+                "args_dir": self.args_dir,
+                "model": model,
+                "tokenizer": tokenizer,
+                "train_dataset": train_dataset,
+                "eval_dataset": eval_dataset,
+                "raw_dataset": raw_dataset,
+                "task_type": self.task_type,
+                "chosen_metric": self.chosen_metric,
+                "specs": self.specs,
+                "fallback_optimizer": fallback_optimizer,
+                "fallback_data_collator": fallback_data_collator
+            }
+            
+            # Add callbacks if available
+            if callbacks:
+                trainer_kwargs["callbacks"] = callbacks
+            
+            # Create trainer instance
+            trainer = self.trainer_class(**trainer_kwargs)
+            
+            # Run the training process
+            logger.info(f"Starting training with {'Lightning' if self.use_lightning else 'standard'} trainer")
+            if self.use_lightning:
+                trainer.fit()
+            else:
+                trainer.train()
+            
+            # Save model and checkpoint
+            logger.info("Saving model and checkpoint")
+            self.save_model_and_checkpoint(model, tokenizer, trainer)
+            
+            # Log final metrics to MLflow if enabled
+            if self.use_mlflow:
+                total_duration = time.time() - start_time
+                mlflow.log_metric("total_training_duration", total_duration)
+                mlflow.log_param("end_time", datetime.now().isoformat())
+                
+                # Log model artifacts
+                model_path = os.path.join(self.specs["output_dir"])
+                if os.path.exists(model_path):
+                    mlflow.log_artifact(model_path, "final_model")
+                
+                # End MLflow run
+                mlflow.end_run()
+            
+            logger.info("Training complete")
+            return model, tokenizer
+            
+        except Exception as e:
+            # End MLflow run if active
+            if self.use_mlflow:
+                mlflow.end_run(status="FAILED")
+                
+            ErrorHandler.handle_error("TRAINING_ERROR", str(e), logger=logger)
+            import traceback
+            traceback.print_exc()
+            return None, None
 
     def save_model_and_checkpoint(self, model, tokenizer, trainer):
         """Save the model, tokenizer, and create a checkpoint."""
