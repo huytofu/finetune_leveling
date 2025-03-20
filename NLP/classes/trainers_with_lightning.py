@@ -16,7 +16,30 @@ import random
 
 @dataclass
 class PeftConfig:
-    """Configuration for PEFT models with enhanced optimization settings"""
+    """
+    Configuration for PEFT (Parameter-Efficient Fine-Tuning) models with enhanced optimization settings.
+    
+    This configuration class extends the basic PEFT configuration with Lightning-specific
+    settings for memory optimization and resource management.
+    
+    Attributes:
+        peft_type (str): Type of PEFT method (e.g., "LORA", "PREFIX")
+        task_type (str): Type of task being performed
+        inference_mode (bool): Whether the model is in inference mode
+        r (int): Rank for LoRA, aligned with default_config
+        lora_alpha (int): Alpha parameter for LoRA
+        lora_dropout (float): Dropout rate for LoRA, aligned with default_config
+        bias (str): Bias handling strategy
+        target_modules (List[str]): Specific modules to apply PEFT to
+        layers_to_transform (List[int]): Specific layers to transform
+        fan_in_fan_out (bool): Whether to use fan-in/fan-out rescaling
+        modules_to_save (List[str]): Modules to save separately
+        init_lora_weights (bool): Whether to initialize LoRA weights
+        use_gradient_checkpointing (bool): Whether to use gradient checkpointing for memory efficiency
+        use_cache (bool): Whether to use cache during forward pass
+        quantization_type (str): Type of quantization to use
+        quantization_bits (int): Number of bits for quantization
+    """
     peft_type: str
     task_type: str
     inference_mode: bool = False
@@ -40,7 +63,15 @@ class PeftConfig:
     
     @classmethod
     def from_pretrained(cls, model):
-        """Create config from a pretrained PEFT model"""
+        """
+        Create config from a pretrained PEFT model.
+        
+        Args:
+            model: The PEFT model to extract configuration from
+            
+        Returns:
+            PeftConfig: A configuration object based on the model's parameters
+        """
         if not hasattr(model, "peft_config"):
             return None
         config = model.peft_config
@@ -64,11 +95,36 @@ class NLPTrainer(pl.LightningModule):
     """
     A PyTorch Lightning trainer class for NLP models.
     
+    This trainer leverages PyTorch Lightning for training loop management, multi-GPU training,
+    and optimization. It can be used independently or as part of the fine-tuning pipeline.
+    
+    Role in the Pipeline:
+    - Provides a Lightning-based training implementation
+    - Manages the training loop with Lightning's lifecycle hooks
+    - Handles distributed training using Lightning's internal mechanisms
+    - Supports PEFT methods with Lightning-specific optimizations
+    - Can integrate with Accelerate for enhanced performance
+    
+    Lightning-Accelerate Coordination:
+    When both Lightning and Accelerate are enabled, this class:
+    1. Uses Lightning for the overall training loop and lifecycle management
+    2. Delegates device/precision handling to Accelerate
+    3. Uses Accelerate's optimized memory management with Lightning's training flow
+    4. Maintains compatibility with Accelerate's distributed features
+    
     Attributes:
-        model: The model to be trained.
-        specs: Configuration specifications for training.
-        task_type: The type of task (e.g., classification, generation).
-        losses: A list to store training losses.
+        model: The model to be trained
+        tokenizer: The tokenizer for text processing
+        data_collator: The data collator for batching
+        train_dataset: The training dataset
+        eval_dataset: The evaluation dataset
+        task_type: The type of task being performed
+        losses: Storage for tracking losses
+        specs: Training specifications
+        optimizer: The optimizer for training
+        scheduler: Learning rate scheduler
+        is_peft_model: Whether this is a PEFT model
+        peft_config: Configuration for PEFT, if applicable
     """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
@@ -78,19 +134,19 @@ class NLPTrainer(pl.LightningModule):
         Initialize the NLPTrainer.
         
         Args:
-            args_dir (str): Directory containing configuration arguments.
-            model: The model to be trained.
-            tokenizer: The tokenizer for text processing.
-            data_collator: The data collator for batching.
-            train_dataset: The training dataset.
-            eval_dataset: The evaluation dataset.
-            task_type (str): The type of task (e.g., classification, generation).
-            optimizer: The optimizer for training.
-            compute_metrics: Function to compute metrics during evaluation.
-            model_init: Function to initialize the model.
-            callbacks: List of callbacks to apply during training.
-            scheduler: Learning rate scheduler.
-            **kwargs: Additional keyword arguments.
+            args_dir (str): Directory containing configuration arguments
+            model: The model to be trained
+            tokenizer: The tokenizer for text processing
+            data_collator: The data collator for batching
+            train_dataset: The training dataset
+            eval_dataset: The evaluation dataset
+            task_type (str): The type of task (e.g., classification, generation)
+            optimizer: The optimizer for training (optional)
+            compute_metrics: Function to compute metrics during evaluation (optional)
+            model_init: Function to initialize the model (optional)
+            callbacks: List of callbacks to apply during training (optional)
+            scheduler: Learning rate scheduler (optional)
+            **kwargs: Additional keyword arguments
         """
         super().__init__()
         self.model = model
@@ -112,9 +168,50 @@ class NLPTrainer(pl.LightningModule):
         # Add PEFT detection and configuration
         self.is_peft_model = self._check_is_peft_model(model)
         self.peft_config = self._get_peft_config() if self.is_peft_model else None
+        
+        # Set flags for Lightning and Accelerate integration
+        self.use_lightning = True
+        self.use_accelerate = kwargs.get('use_accelerate', False)
+        
+        # Initialize Accelerate if both Lightning and Accelerate are enabled
+        if self.use_accelerate:
+            self._setup_accelerate_integration()
+
+    def _setup_accelerate_integration(self):
+        """
+        Set up integration between Lightning and Accelerate.
+        
+        This method configures the trainer to work with both Lightning and
+        Accelerate simultaneously, leveraging the strengths of both frameworks.
+        """
+        try:
+            from accelerate import Accelerator
+            self.accelerator = Accelerator(
+                gradient_accumulation_steps=self.specs.get('gradient_accumulation_steps', 1),
+                mixed_precision=self.specs.get('fp16', True) and 'fp16' or 'no'
+            )
+            
+            # Save original device placement for Lightning
+            self._original_device = self.device
+            
+            # Let Accelerate set the device
+            self.device = self.accelerator.device
+            
+            print(f"Lightning-Accelerate integration: Using {self.device} with mixed precision: {self.accelerator.mixed_precision}")
+        except ImportError:
+            print("Accelerate not installed - falling back to Lightning-only mode")
+            self.use_accelerate = False
 
     def _check_is_peft_model(self, model):
-        """Check if the model is a PEFT model and get its type"""
+        """
+        Check if the model is a PEFT model and get its type.
+        
+        Args:
+            model: The model to check
+            
+        Returns:
+            bool: Whether the model is a PEFT model
+        """
         try:
             from peft import PeftModel
             is_peft = isinstance(model, PeftModel)
@@ -128,7 +225,12 @@ class NLPTrainer(pl.LightningModule):
             return False
 
     def _log_peft_params(self, model):
-        """Log PEFT-specific parameter information"""
+        """
+        Log PEFT-specific parameter information.
+        
+        Args:
+            model: The PEFT model to log information about
+        """
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
         print(f"PEFT model has {trainable_params} trainable parameters out of {total_params} total parameters")
@@ -141,7 +243,12 @@ class NLPTrainer(pl.LightningModule):
                 print(f"Number of prefix tokens: {config.num_virtual_tokens}")
 
     def _get_peft_config(self):
-        """Get PEFT-specific configuration"""
+        """
+        Get PEFT-specific configuration.
+        
+        Returns:
+            PeftConfig: The PEFT configuration object
+        """
         if not self.is_peft_model:
             return None
             
@@ -159,24 +266,30 @@ class NLPTrainer(pl.LightningModule):
         Forward pass through the model.
         
         Args:
-            **inputs: Input data for the model.
+            **inputs: Input data for the model
         
         Returns:
-            Model outputs.
+            Model outputs
         """
         return self.model(**inputs)
 
     def training_step(self, batch, batch_idx):
         """
-        Enhanced training step with PEFT-aware gradient handling.
+        Lightning training step with PEFT-aware gradient handling.
+        
+        Coordinates with Accelerate if both frameworks are enabled.
         
         Args:
-            batch: The batch of data for the current step.
-            batch_idx: The index of the batch.
+            batch: The batch of data for the current step
+            batch_idx: The index of the batch
         
         Returns:
-            Loss from the current training step.
+            Loss from the current training step
         """
+        # Handle batch with Accelerate if enabled
+        if self.use_accelerate:
+            batch = self._prepare_accelerate_batch(batch)
+            
         # Forward pass
         outputs = self.forward(**batch)
         loss = outputs.loss
@@ -199,6 +312,24 @@ class NLPTrainer(pl.LightningModule):
         self.log('train_loss', loss)
         
         return loss
+
+    def _prepare_accelerate_batch(self, batch):
+        """
+        Prepare a batch for processing with Accelerate.
+        
+        Args:
+            batch: The input batch
+            
+        Returns:
+            The prepared batch
+        """
+        if not self.use_accelerate:
+            return batch
+            
+        # Move batch to Accelerate device if needed
+        if hasattr(self, 'accelerator'):
+            return {k: v.to(self.accelerator.device) for k, v in batch.items()}
+        return batch
 
     def clip_gradients(self, loss):
         """

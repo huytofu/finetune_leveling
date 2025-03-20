@@ -26,10 +26,30 @@ from .utils import Logger, ErrorHandler
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @dataclass
 class PeftConfig:
-    """Configuration for PEFT models"""
+    """
+    Configuration for PEFT (Parameter-Efficient Fine-Tuning) models.
+    
+    This class defines the configuration parameters used for different PEFT methods
+    like LoRA, Prefix Tuning, etc.
+    
+    Attributes:
+        peft_type (str): Type of PEFT method (e.g., "LORA", "PREFIX")
+        task_type (str): Type of task being performed
+        inference_mode (bool): Whether the model is in inference mode
+        r (int): Rank for LoRA
+        lora_alpha (int): Alpha parameter for LoRA
+        lora_dropout (float): Dropout rate for LoRA
+        bias (str): Bias handling strategy
+        target_modules (List[str]): Specific modules to apply PEFT to
+        layers_to_transform (List[int]): Specific layers to transform
+        fan_in_fan_out (bool): Whether to use fan-in/fan-out rescaling
+        modules_to_save (List[str]): Modules to save separately
+        init_lora_weights (bool): Whether to initialize LoRA weights
+    """
     peft_type: str
     task_type: str
     inference_mode: bool = False
@@ -69,19 +89,31 @@ args = p.parse_args()
 
 class AcceleratedNLPTrainer():
     """
-    A trainer class for NLP models using the Accelerate library.
+    A trainer class for NLP models using the Hugging Face Accelerate library.
+    
+    This trainer handles the training loop, evaluation, and optimization for NLP models.
+    It integrates with the Accelerate library for distributed training and optimization,
+    and can be used independently or as part of a fine-tuning pipeline.
+    
+    Role in the Pipeline:
+    - Manages the training loop and optimization process
+    - Handles distributed training via Accelerate
+    - Supports PEFT (Parameter-Efficient Fine-Tuning) methods
+    - Provides hooks for callbacks and metrics tracking
+    - Supports checkpoint saving and loading
     
     Attributes:
-        model: The model to be trained.
-        optimizer: The optimizer for training.
-        data_collator: The data collator for batching.
-        datasets: A dictionary containing training and evaluation datasets.
-        raw_dataset: The raw dataset for processing.
-        tokenizer: The tokenizer for text processing.
-        specs: Configuration specifications for training.
-        task_type: The type of task (e.g., classification, generation).
-        losses: A list to store training losses.
-        metric: The evaluation metric.
+        model: The model to be trained
+        optimizer: The optimizer for training
+        data_collator: The data collator for batching
+        datasets: A dictionary containing training and evaluation datasets
+        raw_dataset: The raw dataset for processing
+        tokenizer: The tokenizer for text processing
+        specs: Configuration specifications for training
+        task_type: The type of task (e.g., classification, generation)
+        losses: A list to store training losses
+        metric: The evaluation metric
+        accelerator: The Accelerate instance for distributed training
     """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
@@ -90,16 +122,16 @@ class AcceleratedNLPTrainer():
         Initialize the AcceleratedNLPTrainer.
         
         Args:
-            args_dir (str): Directory containing configuration arguments.
-            model: The model to be trained.
-            tokenizer: The tokenizer for text processing.
-            data_collator: The data collator for batching.
-            train_dataset: The training dataset.
-            eval_dataset: The evaluation dataset.
-            raw_dataset: The raw dataset for processing.
-            task_type (str): The type of task (e.g., classification, generation).
-            optimizer: The optimizer for training.
-            chosen_metric (str): The metric for evaluation.
+            args_dir (str): Directory containing configuration arguments
+            model: The model to be trained
+            tokenizer: The tokenizer for text processing
+            data_collator: The data collator for batching
+            train_dataset: The training dataset
+            eval_dataset: The evaluation dataset
+            raw_dataset: The raw dataset for processing
+            task_type (str): The type of task (e.g., classification, generation)
+            optimizer: The optimizer for training
+            chosen_metric (str): The metric for evaluation
         """
         try:
             self.model = model
@@ -125,47 +157,71 @@ class AcceleratedNLPTrainer():
             
             self._setup_gradient_accumulation()
             
-            Logger.info("AcceleratedNLPTrainer initialized successfully.")
+            # Lightning coordination flag - set to False as this is Accelerate-only
+            self.use_lightning = False
+            self.use_accelerate = True
+            
+            logger.info("AcceleratedNLPTrainer initialized successfully.")
         except Exception as e:
             ErrorHandler.handle_error(e, "AcceleratedNLPTrainer initialization")
 
     def setup_configuration(self):
         """
         Set up configuration using ConfigManager.
+        
+        This loads the configuration from the default specs and any custom settings.
         """
         config_manager = ConfigManager()
         self.specs = vars(config_manager.parse_args())
 
     def _check_is_peft_model(self, model):
-        """Check if the model is a PEFT model and get its type"""
+        """
+        Check if the model is a PEFT model and get its type.
+        
+        Args:
+            model: The model to check
+            
+        Returns:
+            bool: Whether the model is a PEFT model
+        """
         try:
             from peft import PeftModel
             is_peft = isinstance(model, PeftModel)
             if is_peft:
                 peft_type = getattr(model.peft_config, "peft_type", "unknown")
-                Logger.info(f"Detected PEFT model of type: {peft_type}")
+                logger.info(f"Detected PEFT model of type: {peft_type}")
                 self._log_peft_params(model)
             return is_peft
         except ImportError:
-            Logger.info("PEFT not installed, continuing with standard training")
+            logger.info("PEFT not installed, continuing with standard training")
             return False
 
     def _log_peft_params(self, model):
-        """Log PEFT-specific parameter information"""
+        """
+        Log PEFT-specific parameter information.
+        
+        Args:
+            model: The PEFT model to log information about
+        """
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
-        Logger.info(f"PEFT model has {trainable_params} trainable parameters out of {total_params} total parameters")
+        logger.info(f"PEFT model has {trainable_params} trainable parameters out of {total_params} total parameters")
         
         # Log adapter-specific information
         if hasattr(model, "peft_config"):
             config = model.peft_config
             if hasattr(config, "r"):  # LoRA
-                Logger.info(f"LoRA rank: {config.r}")
+                logger.info(f"LoRA rank: {config.r}")
             elif hasattr(config, "num_virtual_tokens"):  # Prefix Tuning
-                Logger.info(f"Number of prefix tokens: {config.num_virtual_tokens}")
+                logger.info(f"Number of prefix tokens: {config.num_virtual_tokens}")
 
     def _get_peft_config(self):
-        """Get PEFT-specific configuration"""
+        """
+        Get PEFT-specific configuration.
+        
+        Returns:
+            PeftConfig: The PEFT configuration object
+        """
         if not self.is_peft_model:
             return None
             
@@ -179,7 +235,15 @@ class AcceleratedNLPTrainer():
         return peft_config
 
     def _setup_optimizer(self, optimizer):
-        """Setup optimizer with PEFT-specific configurations"""
+        """
+        Setup optimizer with PEFT-specific configurations.
+        
+        Args:
+            optimizer: An existing optimizer, or None to create a new one
+            
+        Returns:
+            The configured optimizer
+        """
         if optimizer is not None:
             return optimizer
             
@@ -191,7 +255,7 @@ class AcceleratedNLPTrainer():
                 lr=self.specs.get('learning_rate', 2e-5),
                 weight_decay=self.specs.get('weight_decay', 0.01),
             )
-            Logger.info(f"Created PEFT-aware optimizer with {len(trainable_params)} trainable parameters")
+            logger.info(f"Created PEFT-aware optimizer with {len(trainable_params)} trainable parameters")
         else:
             optimizer = torch.optim.AdamW(
                 self.model.parameters(),
@@ -207,7 +271,7 @@ class AcceleratedNLPTrainer():
             mixed_precision = 'fp16' if self.specs.get('fp16', True) else 'no'
             if self.is_peft_model and hasattr(self.model, 'quantization_config'):
                 if self.model.quantization_config.get('quantization_type') in ['4bit', '8bit']:
-                    Logger.info("Detected quantized PEFT model, adjusting mixed precision settings")
+                    logger.info("Detected quantized PEFT model, adjusting mixed precision settings")
                     mixed_precision = 'bf16'  # Better compatibility with quantized models
             
             self.accelerator = Accelerator(
@@ -225,9 +289,9 @@ class AcceleratedNLPTrainer():
             self.model, self.optimizer, self.train_dataloader, self.eval_dataloader = \
                 self.accelerator.prepare(self.model, self.optimizer, self.train_dataloader, self.eval_dataloader)
                 
-            Logger.info(f"Model prepared with Accelerator using {mixed_precision} precision")
+            logger.info(f"Model prepared with Accelerator using {mixed_precision} precision")
         except Exception as e:
-            Logger.error(f"Error in Accelerator preparation: {e}")
+            logger.error(f"Error in Accelerator preparation: {e}")
             raise
 
     def _setup_gradient_accumulation(self):
@@ -320,7 +384,7 @@ class AcceleratedNLPTrainer():
         
         if self.is_peft_model:
             try:
-                Logger.info(f"Saving PEFT adapter state to {self.specs['output_dir']}")
+                logger.info(f"Saving PEFT adapter state to {self.specs['output_dir']}")
                 # Save adapter state
                 unwrapped_model.save_pretrained(self.specs['output_dir'])
                 
@@ -338,7 +402,7 @@ class AcceleratedNLPTrainer():
                     
                 return
             except Exception as e:
-                Logger.error(f"Error saving PEFT model: {e}")
+                logger.error(f"Error saving PEFT model: {e}")
         
         # Standard save for non-PEFT models
         unwrapped_model.save_pretrained(
@@ -527,7 +591,7 @@ class AcceleratedNLPTrainer():
 
             # Check for NaN or Inf gradients
             if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                Logger.warning(f"Invalid gradients detected in {name}")
+                logger.warning(f"Invalid gradients detected in {name}")
                 param.grad.data = torch.zeros_like(param.grad.data)
                 continue
 
@@ -559,7 +623,7 @@ class AcceleratedNLPTrainer():
             if self.specs.get('debug_gradients', False):
                 trainable_params = [p for p in self.model.parameters() if p.requires_grad]
                 grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params if p.grad is not None]))
-                Logger.debug(f"Gradient norm at step {step}: {grad_norm}")
+                logger.debug(f"Gradient norm at step {step}: {grad_norm}")
 
             return loss.item()
 
@@ -572,7 +636,7 @@ class AcceleratedNLPTrainer():
         Train the model with mixed precision and gradient accumulation.
         """
         for epoch in range(self.num_train_epochs):
-            logging.info(f"Starting epoch {epoch}")
+            logger.info(f"Starting epoch {epoch}")
 
             self.model.train()
             for step, batch in enumerate(self.train_dataloader):
@@ -584,7 +648,7 @@ class AcceleratedNLPTrainer():
 
             self._compute_metrics()
             self.save_and_upload(epoch)
-            logging.info(f"Completed epoch {epoch}")
+            logger.info(f"Completed epoch {epoch}")
 
     def _eval_step(self, batch, step):
         """
@@ -598,7 +662,7 @@ class AcceleratedNLPTrainer():
             outputs = self.model(**batch)
             self.handle_outputs(outputs, batch, self.specs['per_device_eval_batch_size'], 
                                 self.losses, self.metric)
-        logging.info(f"Finished evaluating step {step}")
+        logger.info(f"Finished evaluating step {step}")
 
     def _compute_metrics(self):
         """
@@ -606,7 +670,7 @@ class AcceleratedNLPTrainer():
         """
         losses = torch.cat(self.losses)
         losses = losses[: len(self.datasets['eval'])]
-        logging.info(f"Losses: {losses}")
+        logger.info(f"Losses: {losses}")
 
         if self.task_type == "question_answering":
             self.start_logits = np.concatenate(self.start_logits)
@@ -741,7 +805,7 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             if param.requires_grad and param.grad is not None:
                 # Check for NaN or Inf gradients
                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                    Logger.warning(f"Invalid gradients detected in {name}")
+                    logger.warning(f"Invalid gradients detected in {name}")
                     param.grad.data = torch.zeros_like(param.grad.data)
                     continue
 
@@ -806,7 +870,7 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             return loss.item()
             
         except Exception as e:
-            Logger.error(f"Error in Seq2Seq training step {step}: {e}")
+            logger.error(f"Error in Seq2Seq training step {step}: {e}")
             raise e
 
     def _eval_step(self, batch):
@@ -867,7 +931,7 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
         # Save the full model
         unwrapped_model.save_pretrained(output_dir)
         
-        Logger.info(f"Model saved to {output_dir}")
+        logger.info(f"Model saved to {output_dir}")
 
     def load_model(self, model_path: str):
         """Enhanced model loading with seq2seq state management"""

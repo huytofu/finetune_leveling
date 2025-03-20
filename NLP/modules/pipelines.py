@@ -64,16 +64,39 @@ from tokenizer_modules import TokenizerModules
 from distributed_manager import DistributedManager, DistributedConfig, DistributedBackend
 from .error_handler import ErrorHandler
 
+# Set up logging
+logger = logging.getLogger(__name__)
+
 class MLflowCallback:
-    """Callback for tracking training metrics in MLflow."""
+    """
+    Callback for tracking training metrics in MLflow.
+    
+    This callback integrates with the Hugging Face Transformers trainer to track
+    metrics, parameters, and resource usage throughout the training process.
+    """
     
     def __init__(self, run_id: str):
+        """
+        Initialize the MLflow callback.
+        
+        Args:
+            run_id (str): The MLflow run ID to log metrics to
+        """
         self.run_id = run_id
         self.epoch_start_time = None
         self.step_start_time = None
         
     def on_train_begin(self, args, state, control):
-        """Called when training begins."""
+        """
+        Called when training begins.
+        
+        Logs initial training parameters to MLflow.
+        
+        Args:
+            args: Training arguments
+            state: Training state
+            control: Training control
+        """
         self.epoch_start_time = time.time()
         mlflow.log_param("train_batch_size", args.per_device_train_batch_size)
         mlflow.log_param("eval_batch_size", args.per_device_eval_batch_size)
@@ -480,7 +503,12 @@ class FineTunePipeLine():
             raise
 
     def _setup_mlflow(self):
-        """Setup MLflow tracking."""
+        """
+        Setup MLflow tracking.
+        
+        Initializes the MLflow experiment, starts a run, and logs initial metadata.
+        If an error occurs during setup, MLflow tracking is disabled.
+        """
         self.experiment_name = self.specs.get("experiment_name", "default_experiment")
         self.tracking_uri = self.specs.get("tracking_uri", "sqlite:///mlflow.db")
         
@@ -563,7 +591,20 @@ class FineTunePipeLine():
             return default_data_collator
 
     def _get_trainer_class(self):
-        """Get the appropriate trainer class based on configuration."""
+        """
+        Get the appropriate trainer class based on configuration.
+        
+        The selection logic works as follows:
+        1. If Lightning is enabled, use Lightning-based trainers
+        2. If Accelerate is enabled but not Lightning, use Accelerate-based trainers
+        3. If neither is enabled, use standard trainers
+        
+        For each case, select Seq2Seq trainers for generation tasks,
+        or standard trainers for other tasks.
+        
+        Returns:
+            The appropriate trainer class based on the task type and acceleration settings
+        """
         if self.use_lightning:
             if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
                 return AcceleratedNLPSeq2SeqTrainerWithLightning
@@ -576,9 +617,24 @@ class FineTunePipeLine():
             if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
                 return NLPSeq2SeqTrainer
             return NLPTrainer
-
+        
     def run(self):
-        """Run the fine-tuning pipeline."""
+        """
+        Run the fine-tuning pipeline.
+        
+        This method orchestrates the entire fine-tuning process:
+        1. Load and configure the model and tokenizer
+        2. Apply quantization if specified
+        3. Apply PEFT methods if specified
+        4. Prepare datasets for the task
+        5. Set up training callbacks
+        6. Initialize and run the trainer
+        7. Save the model and checkpoints
+        8. Log final metrics
+        
+        Returns:
+            The trained model and tokenizer
+        """
         logger.info(f"Starting fine-tuning for task: {self.task_type}")
         start_time = time.time()
         
@@ -604,7 +660,7 @@ class FineTunePipeLine():
             # Optimize memory layout
             logger.info("Optimizing memory layout")
             model = self.type_utils.optimize_memory_layout(model, self.peft_method)
-            
+        
             # Apply PEFT if specified
             if self.peft_method:
                 logger.info(f"Applying PEFT method: {self.peft_method}")
