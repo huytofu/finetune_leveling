@@ -31,7 +31,8 @@ from transformers import (
     AutoModelForTokenClassification,
     AutoModelForSeq2SeqLM,
     AutoModelForQuestionAnswering,
-    AutoModel
+    AutoModel,
+    AutoModelForCausalLM
 )
 import time
 import mlflow
@@ -467,6 +468,14 @@ class FineTuneConfig:
     use_curriculum_learning: bool = False
     use_few_shot: bool = False
     
+    # Large model optimization (for 10B-100B models)
+    use_gradient_checkpointing: bool = False
+    use_flash_attention: bool = False
+    use_deepspeed: bool = False
+    deepspeed_stage: int = 2
+    deepspeed_offload_optimizer: bool = False
+    deepspeed_offload_parameters: bool = False
+    
     # PEFT configuration
     use_peft: bool = False
     peft_method: str = "lora"  # Options: "lora", "prefix", "prompt", "adapter"
@@ -582,7 +591,7 @@ class FineTuneConfig:
                 AcceleratedNLPSeq2SeqTrainer
                 if is_seq2seq
                 else AcceleratedNLPTrainer
-            )
+                )
         else:
             logger.info("Using standard trainer")
             return NLPSeq2SeqTrainer if is_seq2seq else NLPTrainer
@@ -786,51 +795,43 @@ class FineTunePipeline:
 
     def _initialize_trainer(self, train_dataset, eval_dataset, **kwargs):
         """Initialize the appropriate trainer with all necessary components."""
-        # Prepare training arguments
+        trainer_cls = self._get_trainer_class()
+        
+        # Create DeepSpeed config if enabled
+        deepspeed_config = None
+        if self.config.use_deepspeed:
+            logger.info(f"Enabling DeepSpeed ZeRO Stage-{self.config.deepspeed_stage}")
+            deepspeed_config = {
+                "train_batch_size": self.config.batch_size,
+                "fp16": {"enabled": self.config.use_mixed_precision},
+                "bf16": {"enabled": not self.config.use_mixed_precision and hasattr(torch, "bfloat16")},
+                "zero_optimization": {
+                    "stage": self.config.deepspeed_stage,
+                    "offload_optimizer": self.config.deepspeed_offload_optimizer,
+                    "offload_param": self.config.deepspeed_offload_parameters,
+                    "overlap_comm": True,
+                    "contiguous_gradients": True,
+                    "reduce_bucket_size": 5e8
+                }
+            }
+        
+        # Create training arguments
         training_args = TrainingArguments(
             output_dir=os.path.join("checkpoints", self.config.task_type),
-            **self.config.__dict__
-        )
-        
-        # Get data collator based on task type
-        data_collator = self._get_data_collator()
-        
-        # Initialize trainer
-        trainer = self.trainer_class(
-            args_dir=training_args,
-            model=self.model,
-            tokenizer=self.tokenizer,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            task_type=self.config.task_type,
-            compute_metrics=self.compute_metrics,
-            callbacks=[MLflowCallback(self.mlflow_tracker.run_id)] if self.mlflow_tracker else None,
+            deepspeed=deepspeed_config,
             **kwargs
         )
         
-        return trainer
-
-    def _get_data_collator(self):
-        """Get appropriate data collator based on task type."""
-        if self.config.task_type == "language-modeling":
-            return DataCollatorForLanguageModeling(
-                tokenizer=self.tokenizer,
-                mlm=True,
-                mlm_probability=0.15
-            )
-        elif self.config.task_type in ["summarization", "translation"]:
-            return DataCollatorForSeq2Seq(
-                tokenizer=self.tokenizer,
-                model=self.model,
-                padding=True
-            )
-        elif self.config.task_type == "token-classification":
-            return DataCollatorForTokenClassification(
-                tokenizer=self.tokenizer
-                )
-        else:
-            return default_data_collator
+        # Create and return trainer
+        return trainer_cls(
+            model=self.model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=self.tokenizer,
+            data_collator=self.data_collator,
+            compute_metrics=self.compute_metrics
+        )
 
     def prepare_training_data(
         self,
@@ -1145,13 +1146,52 @@ class FineTunePipeline:
         return predictions.tolist()
 
     def _initialize_model(self, config: FineTuneConfig):
-        """Initialize model with PEFT if enabled."""
+        """Initialize model with optimizations for large models."""
         try:
+            # Determine model loading kwargs
+            model_kwargs = {}
+            
+            # Enable Flash Attention if requested
+            if config.use_flash_attention:
+                logger.info("Enabling Flash Attention 2.0")
+                model_kwargs["attn_implementation"] = "flash_attention_2"
+                # Flash Attention works best with BF16
+                model_kwargs["torch_dtype"] = torch.bfloat16
+            
             # Load base model
-            model = AutoModelForSequenceClassification.from_pretrained(
-                config.model_name,
-                num_labels=self.num_labels
-            )
+            logger.info(f"Loading model: {config.model_name}")
+            if config.task_type == "text_classification":
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    config.model_name,
+                    num_labels=self.num_labels,
+                    **model_kwargs
+                )
+            elif config.task_type == "token-classification":
+                model = AutoModelForTokenClassification.from_pretrained(
+                    config.model_name,
+                    num_labels=self.num_labels,
+                    **model_kwargs
+                )
+            elif config.task_type in ["summarization", "translation"]:
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    config.model_name,
+                    **model_kwargs
+                )
+            elif config.task_type == "question-answering":
+                model = AutoModelForQuestionAnswering.from_pretrained(
+                    config.model_name,
+                    **model_kwargs
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    config.model_name,
+                    **model_kwargs
+                )
+            
+            # Enable Gradient Checkpointing if requested
+            if config.use_gradient_checkpointing:
+                logger.info("Enabling Gradient Checkpointing")
+                model.gradient_checkpointing_enable()
             
             # Apply PEFT if enabled
             if config.use_peft:
@@ -1169,7 +1209,7 @@ class FineTunePipeline:
                     
                 model = get_peft_model(model, peft_config)
                 model.print_trainable_parameters()
-                
+            
             return model
             
         except Exception as e:
