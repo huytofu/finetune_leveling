@@ -476,18 +476,35 @@ class FineTuneConfig:
     deepspeed_offload_optimizer: bool = False
     deepspeed_offload_parameters: bool = False
     
+    # Quantization options
+    use_quantization: bool = False
+    quantization_bits: int = 8  # 4 or 8 bits supported
+    quantization_method: str = "bitsandbytes"  # "bitsandbytes", "auto_gptq" or "awq"
+    awq_zero_point: bool = True  # AWQ-specific setting
+    awq_group_size: int = 128    # AWQ-specific setting
+    
     # PEFT configuration
     use_peft: bool = False
-    peft_method: str = "lora"  # Options: "lora", "prefix", "prompt", "adapter"
+    peft_method: str = "lora"  # Primary: "lora", "prefix", "prompt", "adapter"
+    secondary_peft_method: str = None  # For mixing methods (optional)
     
-    # Distillation configuration
+    # PEFT parameters
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    prefix_length: int = 30
+    adapter_size: int = 64
+    
+    # Pruning config
+    use_pruning: bool = False
+    pruning_sparsity: float = 0.3
+    pruning_method: str = "magnitude"  # "magnitude", "structured", or "movement"
+    
+    # Distillation config
     use_distillation: bool = False
-    teacher_model_name: Optional[str] = None
+    teacher_model_name: str = None
     distillation_alpha: float = 0.5
-    temperature: float = 2.0
-    distill_logits: bool = True
-    distill_hidden_states: bool = False
-    teacher_layers_to_distill: Optional[List[int]] = None
+    distillation_temperature: float = 2.0
     
     # LoRA specific settings
     lora_r: int = 8  # rank of LoRA matrices
@@ -496,15 +513,12 @@ class FineTuneConfig:
     lora_target_modules: Optional[List[str]] = None
     
     # Prefix-tuning settings
-    prefix_length: int = 30
     prefix_projection: bool = False
     
     # Prompt-tuning settings
-    prompt_length: int = 100
     prompt_initialization: str = "random"  # Options: "random", "text", "embedding"
     
     # Adapter settings
-    adapter_size: int = 64
     adapter_dropout: float = 0.1
     adapter_scaling: float = 1.0
     
@@ -553,7 +567,7 @@ class FineTuneConfig:
             }
         elif self.peft_method == "prompt":
             return {
-                "num_virtual_tokens": self.prompt_length,
+                "num_virtual_tokens": self.prefix_length,
                 "prompt_initialization": self.prompt_initialization,
                 "task_type": self.task_type
             }
@@ -733,31 +747,7 @@ class FineTunePipeline:
             if self.config.use_distillation:
                 try:
                     # Load teacher model
-                    teacher_model = None
-                    if self.config.teacher_model_name:
-                        logger.info(f"Loading teacher model: {self.config.teacher_model_name}")
-                        if self.config.task_type == "text_classification":
-                            teacher_model = AutoModelForSequenceClassification.from_pretrained(
-                                self.config.teacher_model_name,
-                                num_labels=self.num_labels
-                            )
-                        elif self.config.task_type == "token-classification":
-                            teacher_model = AutoModelForTokenClassification.from_pretrained(
-                                self.config.teacher_model_name,
-                                num_labels=self.num_labels
-                            )
-                        elif self.config.task_type in ["summarization", "translation"]:
-                            teacher_model = AutoModelForSeq2SeqLM.from_pretrained(
-                                self.config.teacher_model_name
-                            )
-                        elif self.config.task_type == "question-answering":
-                            teacher_model = AutoModelForQuestionAnswering.from_pretrained(
-                                self.config.teacher_model_name
-                            )
-                        else:
-                            teacher_model = AutoModel.from_pretrained(
-                                self.config.teacher_model_name
-                            )
+                    teacher_model = self._initialize_distillation()
                     
                     self.distillation_manager = DistillationManager(
                         self.model,
@@ -1158,6 +1148,77 @@ class FineTunePipeline:
                 # Flash Attention works best with BF16
                 model_kwargs["torch_dtype"] = torch.bfloat16
             
+            # Enable quantization if requested
+            if config.use_quantization:
+                logger.info(f"Enabling {config.quantization_bits}-bit quantization with {config.quantization_method}")
+                if config.quantization_method == "bitsandbytes":
+                    # BitsAndBytes quantization
+                    from transformers import BitsAndBytesConfig
+                    
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=config.quantization_bits == 4,
+                        load_in_8bit=config.quantization_bits == 8,
+                        llm_int8_threshold=6.0,
+                        llm_int8_has_fp16_weight=False,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.bfloat16
+                    )
+                    model_kwargs["quantization_config"] = quantization_config
+                elif config.quantization_method == "auto_gptq":
+                    # GPTQ quantization
+                    model_kwargs["device_map"] = "auto"
+                    model_kwargs["quantization_config"] = {
+                        "bits": config.quantization_bits,
+                        "group_size": 128,
+                        "desc_act": True
+                    }
+                elif config.quantization_method == "awq":
+                    # AWQ quantization
+                    logger.info("Using AWQ quantization")
+                    try:
+                        from awq import AutoAWQForCausalLM
+                        
+                        # AWQ requires different loading mechanism
+                        if config.task_type in ["text-generation", "causal-lm"]:
+                            # Save original model name for later loading
+                            model_name = config.model_name
+                            
+                            # AWQ is loaded differently and we'll return it directly
+                            model = AutoAWQForCausalLM.from_quantized(
+                                model_name,
+                                device_map="auto",
+                                use_exllama=True,  # Use exllama backend for better performance
+                                safetensors=True,
+                                fuse_layers=True,
+                                zero_point=config.awq_zero_point,
+                                group_size=config.awq_group_size,
+                                trust_remote_code=True
+                            )
+                            
+                            # Skip normal model loading
+                            logger.info(f"Loaded AWQ quantized model: {model_name}")
+                            return model
+                        else:
+                            logger.warning(f"AWQ only supports causal language models. Falling back to BitsAndBytes for {config.task_type}")
+                            # Fall back to BitsAndBytes for non-CLM models
+                            from transformers import BitsAndBytesConfig
+                            quantization_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_quant_type="nf4"
+                            )
+                            model_kwargs["quantization_config"] = quantization_config
+                    except ImportError:
+                        logger.warning("AWQ package not found. Please install it with: pip install awq")
+                        logger.warning("Falling back to BitsAndBytes quantization")
+                        # Fall back to BitsAndBytes
+                        from transformers import BitsAndBytesConfig
+                        quantization_config = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="nf4"
+                        )
+                        model_kwargs["quantization_config"] = quantization_config
+            
             # Load base model
             logger.info(f"Loading model: {config.model_name}")
             if config.task_type == "text_classification":
@@ -1195,27 +1256,178 @@ class FineTunePipeline:
             
             # Apply PEFT if enabled
             if config.use_peft:
-                from peft import get_peft_model, LoraConfig, PrefixTuningConfig, PromptTuningConfig, AdapterConfig
+                logger.info(f"Applying PEFT method: {config.peft_method}")
                 
-                peft_config = None
+                # Import PEFT modules
+                from peft import (
+                    get_peft_model, 
+                    LoraConfig, 
+                    PrefixTuningConfig, 
+                    PromptTuningConfig,
+                    AdapterConfig,
+                    TaskType,
+                    MultitaskPromptTuningConfig,
+                    PromptEncoderConfig
+                )
+                
+                task_type = TaskType.CAUSAL_LM
+                if config.task_type == "text_classification":
+                    task_type = TaskType.SEQ_CLS
+                elif config.task_type == "token-classification":
+                    task_type = TaskType.TOKEN_CLS
+                elif config.task_type in ["summarization", "translation"]:
+                    task_type = TaskType.SEQ_2_SEQ_LM
+                
+                # Configure primary PEFT method
+                peft_configs = []
+                
                 if config.peft_method == "lora":
-                    peft_config = LoraConfig(**config.get_peft_config())
+                    peft_configs.append(LoraConfig(
+                        r=config.lora_r,
+                        lora_alpha=config.lora_alpha,
+                        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                        lora_dropout=config.lora_dropout,
+                        bias="none",
+                        task_type=task_type
+                    ))
                 elif config.peft_method == "prefix":
-                    peft_config = PrefixTuningConfig(**config.get_peft_config())
+                    peft_configs.append(PrefixTuningConfig(
+                        task_type=task_type,
+                        prefix_length=config.prefix_length,
+                        num_virtual_tokens=config.prefix_length
+                    ))
                 elif config.peft_method == "prompt":
-                    peft_config = PromptTuningConfig(**config.get_peft_config())
+                    peft_configs.append(PromptTuningConfig(
+                        task_type=task_type,
+                        num_virtual_tokens=config.prefix_length
+                    ))
                 elif config.peft_method == "adapter":
-                    peft_config = AdapterConfig(**config.get_peft_config())
+                    peft_configs.append(AdapterConfig(
+                        adapter_size=config.adapter_size
+                    ))
+                
+                # Configure secondary PEFT method if specified
+                if config.secondary_peft_method:
+                    logger.info(f"Applying secondary PEFT method: {config.secondary_peft_method}")
                     
-                model = get_peft_model(model, peft_config)
+                    if config.secondary_peft_method == "lora":
+                        peft_configs.append(LoraConfig(
+                            r=config.lora_r,
+                            lora_alpha=config.lora_alpha,
+                            target_modules=["q_proj", "v_proj"],  # Using fewer target modules for secondary
+                            lora_dropout=config.lora_dropout,
+                            bias="none",
+                            task_type=task_type
+                        ))
+                    elif config.secondary_peft_method == "prefix":
+                        peft_configs.append(PrefixTuningConfig(
+                            task_type=task_type,
+                            prefix_length=config.prefix_length // 2,  # Using shorter prefix for secondary
+                            num_virtual_tokens=config.prefix_length // 2
+                        ))
+                    elif config.secondary_peft_method == "adapter":
+                        peft_configs.append(AdapterConfig(
+                            adapter_size=config.adapter_size // 2  # Smaller adapter for secondary
+                        ))
+                
+                # Apply PEFT configuration(s)
+                if len(peft_configs) == 1:
+                    # Single PEFT method
+                    model = get_peft_model(model, peft_configs[0])
+                else:
+                    # Multiple PEFT methods (experimental)
+                    from peft import PeftModel
+                    
+                    # Apply first method
+                    model = get_peft_model(model, peft_configs[0])
+                    
+                    # Apply second method with a different adapter name
+                    model = PeftModel.from_pretrained(
+                        model,
+                        model.base_model.model_name_or_path,
+                        adapter_name="secondary_adapter",
+                        peft_config=peft_configs[1]
+                    )
+                    
+                    # Activate both adapters
+                    model.active_adapters = ["default", "secondary_adapter"]
+                
                 model.print_trainable_parameters()
             
-            return model
+            # Apply pruning if enabled (with minimal code)
+            if config.use_pruning and not config.use_peft:
+                # Only apply pruning if not using PEFT (as a simple approach)
+                logger.info(f"Applying {config.pruning_method} pruning with {config.pruning_sparsity*100}% sparsity")
+                try:
+                    # Simple magnitude pruning with torch.nn.utils.prune
+                    import torch.nn.utils.prune as prune
+                    
+                    # Apply pruning to linear layers only
+                    for name, module in model.named_modules():
+                        if isinstance(module, torch.nn.Linear):
+                            prune.l1_unstructured(module, name='weight', amount=config.pruning_sparsity)
+                            
+                    logger.info("Pruning applied successfully")
+                except Exception as e:
+                    logger.warning(f"Pruning could not be applied: {str(e)}")
             
+            return model
+                
         except Exception as e:
             logger.error(f"Error initializing model: {str(e)}")
             ErrorHandler.handle_error(e, "model_initialization")
             raise
+    
+    def _initialize_distillation(self):
+        """Initialize distillation components if enabled."""
+        if self.config.use_distillation and self.config.teacher_model_name:
+            logger.info(f"Initializing knowledge distillation with teacher model: {self.config.teacher_model_name}")
+            try:
+                # Load teacher model with the same configuration but without PEFT/quantization
+                teacher_kwargs = {}
+                
+                # Teacher should be loaded in evaluation mode and with low precision if possible
+                teacher_kwargs["torch_dtype"] = torch.float16
+                
+                if self.config.task_type == "text_classification":
+                    teacher_model = AutoModelForSequenceClassification.from_pretrained(
+                        self.config.teacher_model_name,
+                        num_labels=self.num_labels,
+                        **teacher_kwargs
+                    )
+                elif self.config.task_type == "token-classification":
+                    teacher_model = AutoModelForTokenClassification.from_pretrained(
+                        self.config.teacher_model_name,
+                        num_labels=self.num_labels,
+                        **teacher_kwargs
+                    )
+                elif self.config.task_type in ["summarization", "translation"]:
+                    teacher_model = AutoModelForSeq2SeqLM.from_pretrained(
+                        self.config.teacher_model_name,
+                        **teacher_kwargs
+                    )
+                elif self.config.task_type == "question-answering":
+                    teacher_model = AutoModelForQuestionAnswering.from_pretrained(
+                        self.config.teacher_model_name,
+                        **teacher_kwargs
+                )
+                else:
+                    teacher_model = AutoModelForCausalLM.from_pretrained(
+                        self.config.teacher_model_name,
+                        **teacher_kwargs
+                    )
+                
+                # Set teacher model to evaluation mode
+                teacher_model.eval()
+                for param in teacher_model.parameters():
+                    param.requires_grad = False
+                    
+                return teacher_model
+            except Exception as e:
+                logger.error(f"Error loading teacher model: {str(e)}")
+                ErrorHandler.handle_error(e, "distillation_initialization")
+                return None
+        return None
 
 
 
