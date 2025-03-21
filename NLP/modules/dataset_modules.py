@@ -313,10 +313,10 @@ class DatasetModules:
     def __init__(self, dataset_dir: str, tokenizer: Any, specs: Dict[str, Any]):
         """Initialize with enhanced features."""
         try:
-            self.dataset_dir = dataset_dir
-            self.tokenizer = tokenizer
-            self.specs = specs
-            
+        self.dataset_dir = dataset_dir
+        self.tokenizer = tokenizer
+        self.specs = specs
+
             # Initialize configurations
             self.config = DatasetConfig(**{
                 **specs,
@@ -672,7 +672,7 @@ class DatasetModules:
             # Process answer positions for training
             start_positions = []
             end_positions = []
-            
+
             for i, offset in enumerate(offset_mapping):
                 sample_idx = sample_map[i]
                 answer = examples["answers"][sample_idx]
@@ -784,7 +784,7 @@ class DatasetModules:
             # Use Polars for efficient concatenation
             df = pl.DataFrame(examples)
             
-            # Concatenate all texts
+        # Concatenate all texts
             concatenated = {
                 k: df[k].explode().to_list()
                 for k in examples.keys()
@@ -792,10 +792,10 @@ class DatasetModules:
             
             total_length = len(concatenated[list(examples.keys())[0]])
             chunk_size = self.config.chunk_size
-            total_length = (total_length // chunk_size) * chunk_size
+        total_length = (total_length // chunk_size) * chunk_size
             
             # Split by chunks efficiently
-            results = {
+        results = {
                 k: [
                     t[i:i + chunk_size]
                     for i in range(0, total_length, chunk_size)
@@ -803,8 +803,8 @@ class DatasetModules:
                 for k, t in concatenated.items()
             }
             
-            results["labels"] = results["input_ids"].copy()
-            return results
+        results["labels"] = results["input_ids"].copy()
+        return results
         except Exception as e:
             logger.error(f"Error in group_texts: {e}")
             raise
@@ -813,12 +813,12 @@ class DatasetModules:
         """Prepare dataset with distributed training support."""
         try:
             start_time = time.time()
-            self.task_type = task_type
-            self.raw_dataset = dataset
-            
+        self.task_type = task_type
+        self.raw_dataset = dataset
+
             # Split dataset for distributed training
             if self.config.distributed:
-                if 'eval' not in self.raw_dataset.keys():
+        if 'eval' not in self.raw_dataset.keys():
                     self.raw_dataset = self.raw_dataset["train"].train_test_split(
                         train_size=0.9,
                         seed=42 + self.config.local_rank  # Different seed per rank
@@ -871,8 +871,8 @@ class DatasetModules:
             total_duration = time.time() - start_time
             self.mlflow_tracker.log_timing_metric("dataset_preparation", total_duration)
             
-            return {
-                "train": train_dataset,
+        return {
+            "train": train_dataset,
                 "eval": eval_dataset,
                 "train_sampler": train_sampler,
                 "eval_sampler": eval_sampler
@@ -896,8 +896,8 @@ class DatasetModules:
                     if self.config.distributed else 'train'
                 )
             else:
-                self.raw_dataset = load_dataset(self.dataset_dir)
-            
+        self.raw_dataset = load_dataset(self.dataset_dir)
+
             return self.prepare_dataset(self.raw_dataset, task_type)
             
         except Exception as e:

@@ -81,6 +81,8 @@ from .curriculum_learning import CurriculumConfig, CurriculumManager
 from .few_shot_adaptation import FewShotConfig, FewShotAdapter
 from .distillation import DistillationConfig, DistillationManager
 from .mlflow_tracking import MLflowTracker
+from .advanced_training import AdvancedTrainingConfig, AdvancedTrainingManager
+from .model_merging import ModelMergeConfig, ModelMerger
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -483,6 +485,28 @@ class FineTuneConfig:
     awq_zero_point: bool = True  # AWQ-specific setting
     awq_group_size: int = 128    # AWQ-specific setting
     
+    # Advanced training features
+    use_advanced_training: bool = False
+    
+    # Multi-node training (Axolotl based)
+    use_multi_node: bool = False
+    num_nodes: int = 1
+    node_rank: int = 0
+    master_addr: str = "localhost"
+    master_port: str = "29500"
+    
+    # Hardware optimization (Unsloth based)
+    use_unsloth: bool = False
+    unsloth_max_seq_length: int = 2048
+    
+    # RLHF (TRL based)
+    use_rlhf: bool = False
+    rlhf_method: str = "ppo"  # Options: "ppo", "dpo", "orpo"
+    reward_model_name: Optional[str] = None
+    num_ppo_epochs: int = 1
+    kl_penalty_coefficient: float = 0.1
+    beta: float = 0.1  # DPO specific
+    
     # PEFT configuration
     use_peft: bool = False
     peft_method: str = "lora"  # Primary: "lora", "prefix", "prompt", "adapter"
@@ -505,6 +529,14 @@ class FineTuneConfig:
     teacher_model_name: str = None
     distillation_alpha: float = 0.5
     distillation_temperature: float = 2.0
+    
+    # Model merging config
+    use_model_merging: bool = False
+    merge_method: str = "weighted_average"  # "weighted_average", "selective", "frankenstein"
+    merge_models: List[str] = field(default_factory=list)  # List of model names to merge
+    merge_weights: Dict[str, float] = field(default_factory=dict)  # Weights for weighted average
+    merge_layer_mapping: Dict[str, Union[List[str], str]] = field(default_factory=dict)  # For selective/frankenstein
+    verify_merged_model: bool = True
     
     # LoRA specific settings
     lora_r: int = 8  # rank of LoRA matrices
@@ -587,48 +619,63 @@ class FineTuneConfig:
         
         if self.use_lightning and self.use_accelerate:
             logger.info("Using Lightning with Accelerate integration")
-            return (
-                AcceleratedNLPSeq2SeqTrainerWithLightning
-                if is_seq2seq
-                else AcceleratedNLPTrainerWithLightning
-            )
+            if is_seq2seq:
+                return AcceleratedNLPSeq2SeqTrainerWithLightning
+            else:
+                return AcceleratedNLPTrainerWithLightning
         elif self.use_lightning:
             logger.info("Using Lightning trainer")
-            return (
-                NLPSeq2SeqTrainerWithLightning
-                if is_seq2seq
-                else NLPTrainerWithLightning
-            )
+            if is_seq2seq:
+                return NLPSeq2SeqTrainerWithLightning
+            else:
+                return NLPTrainerWithLightning
         elif self.use_accelerate:
             logger.info("Using Accelerate trainer")
-            return (
-                AcceleratedNLPSeq2SeqTrainer
-                if is_seq2seq
-                else AcceleratedNLPTrainer
-                )
+            if is_seq2seq:
+                return AcceleratedNLPSeq2SeqTrainer
+            else:
+                return AcceleratedNLPTrainer
         else:
             logger.info("Using standard trainer")
-            return NLPSeq2SeqTrainer if is_seq2seq else NLPTrainer
+            if is_seq2seq:
+                return NLPSeq2SeqTrainer
+            else:
+                return NLPTrainer
             
     def _validate_config(self):
-        """Validate configuration settings."""
-        # Validate framework settings
-        if self.use_lightning and not self._is_lightning_available():
-            logger.warning("PyTorch Lightning not available, falling back to standard training")
+        """Validate configuration."""
+        # Validate framework options
+        if self.use_lightning and not LIGHTNING_AVAILABLE:
+            logger.warning("PyTorch Lightning not available. Lightning training disabled.")
             self.use_lightning = False
-            
-        if self.use_accelerate and not self._is_accelerate_available():
-            logger.warning("Accelerate not available, falling back to standard training")
+        
+        if self.use_accelerate and not ACCELERATE_AVAILABLE:
+            logger.warning("Accelerate not available. Accelerate training disabled.")
             self.use_accelerate = False
             
-        # Validate distillation settings
-        if self.use_distillation and not self.teacher_model_name:
-            raise ValueError("Teacher model name must be provided when using distillation")
-            
-        # Validate PEFT settings
-        if self.use_peft and self.peft_method not in ["lora", "prefix", "prompt", "adapter"]:
-            raise ValueError(f"Unsupported PEFT method: {self.peft_method}")
-            
+        # Validate RLHF compatibility
+        if self.config.use_rlhf:
+            # RLHF is not compatible with Lightning or Accelerate
+            if self.use_lightning:
+                logger.warning("RLHF is not compatible with PyTorch Lightning. Disabling Lightning.")
+                self.use_lightning = False
+            if self.use_accelerate:
+                logger.warning("RLHF is not compatible with Accelerate. Disabling Accelerate.")
+                self.use_accelerate = False
+        
+        # Validate Unsloth compatibility
+        if hasattr(self.config, 'use_unsloth') and self.config.use_unsloth:
+            # Check if model is supported by Unsloth
+            from .advanced_training import UnslothIntegration
+            if not UnslothIntegration.is_model_supported(self.config.model_name):
+                logger.warning(f"Model {self.config.model_name} is not supported by Unsloth. Disabling Unsloth.")
+                self.config.use_unsloth = False
+        
+        # Ensure advanced training config is validated
+        if hasattr(self.config, 'use_advanced_training') and self.config.use_advanced_training:
+            from .advanced_training import validate_advanced_config
+            validate_advanced_config(self.config)
+
     @staticmethod
     def _is_lightning_available():
         """Check if PyTorch Lightning is available."""
@@ -783,45 +830,166 @@ class FineTunePipeline:
         except Exception as e:
             logger.warning(f"Failed to initialize metrics: {str(e)}")
 
-    def _initialize_trainer(self, train_dataset, eval_dataset, **kwargs):
-        """Initialize the appropriate trainer with all necessary components."""
+    def _initialize_trainer(self, model, train_dataset, eval_dataset=None):
+        """Initialize trainer with optimizations for large models."""
+        logger.info(f"Initializing {self.task_type} trainer with optimizations")
+        
+        # Handle advanced training features first (multi-node, RLHF)
+        if hasattr(self.config, 'use_advanced_training') and self.config.use_advanced_training:
+            try:
+                from .advanced_training import AdvancedTrainingManager
+                
+                # Create advanced training manager
+                advanced_config = self._create_advanced_training_config()
+                self.advanced_manager = AdvancedTrainingManager(advanced_config)
+                
+                # Set up distributed environment if using multi-node
+                if self.config.use_multi_node:
+                    logger.info("Setting up distributed training environment")
+                    success = self.advanced_manager.setup_distributed()
+                    if not success:
+                        logger.warning("Failed to set up distributed environment. Falling back to single-node training.")
+                        self.config.use_multi_node = False
+                    else:
+                        # Prepare model for distributed training
+                        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+                        from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+                        
+                        # Try to identify the right transformer layer class
+                        transformer_layer_cls = None
+                        if "llama" in self.config.model_name.lower():
+                            transformer_layer_cls = LlamaDecoderLayer
+                        elif "mistral" in self.config.model_name.lower():
+                            transformer_layer_cls = MistralDecoderLayer
+                        
+                        # Prepare model for distributed training (DDP or FSDP)
+                        model = self.advanced_manager.prepare_model_for_distributed(model, transformer_layer_cls)
+                        
+                        # Get distributed sampler for dataset
+                        train_sampler = self.advanced_manager.get_data_sampler(train_dataset)
+                        eval_sampler = self.advanced_manager.get_data_sampler(eval_dataset) if eval_dataset else None
+                
+                # Apply RLHF if enabled
+                if self.config.use_rlhf:
+                    logger.info(f"Using RLHF with method: {self.config.rlhf_method}")
+                    
+                    # We need to ensure we're using the right datasets format for RLHF
+                    # For DPO: we need preference pairs
+                    # For PPO: we need a reward model and prompts
+                    rlhf_datasets = self._prepare_rlhf_datasets(train_dataset, eval_dataset)
+                    
+                    # Train with RLHF
+                    model = self.advanced_manager.train_with_rlhf(
+                        model, 
+                        self.tokenizer, 
+                        rlhf_datasets,
+                        reward_model=self.reward_model if hasattr(self, "reward_model") else None
+                    )
+                    
+                    # Return the RLHF-trained model directly
+                    # We don't need a standard trainer when using RLHF
+                    return model
+                    
+            except ImportError as e:
+                logger.warning(f"Could not initialize advanced training features: {str(e)}")
+                logger.warning("Falling back to standard training")
+        
+        # Standard training (Lightning, Accelerate, or default)
+        # Prepare Training Arguments
+        training_args = self._create_training_arguments()
+        
+        # Get trainer class based on framework and task
         trainer_cls = self._get_trainer_class()
         
-        # Create DeepSpeed config if enabled
-        deepspeed_config = None
-        if self.config.use_deepspeed:
-            logger.info(f"Enabling DeepSpeed ZeRO Stage-{self.config.deepspeed_stage}")
-            deepspeed_config = {
-                "train_batch_size": self.config.batch_size,
-                "fp16": {"enabled": self.config.use_mixed_precision},
-                "bf16": {"enabled": not self.config.use_mixed_precision and hasattr(torch, "bfloat16")},
-                "zero_optimization": {
-                    "stage": self.config.deepspeed_stage,
-                    "offload_optimizer": self.config.deepspeed_offload_optimizer,
-                    "offload_param": self.config.deepspeed_offload_parameters,
-                    "overlap_comm": True,
-                    "contiguous_gradients": True,
-                    "reduce_bucket_size": 5e8
-                }
-            }
+        # Prepare compute metrics function for evaluation
+        compute_metrics_fn = self.compute_metrics if self.metric else None
         
-        # Create training arguments
-        training_args = TrainingArguments(
-            output_dir=os.path.join("checkpoints", self.config.task_type),
-            deepspeed=deepspeed_config,
-            **kwargs
-        )
-        
-        # Create and return trainer
-        return trainer_cls(
-            model=self.model,
+        # Initialize trainer
+        trainer = trainer_cls(
+            model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             tokenizer=self.tokenizer,
+            compute_metrics=compute_metrics_fn,
             data_collator=self.data_collator,
-            compute_metrics=self.compute_metrics
         )
+        
+        return trainer
+
+    def _prepare_rlhf_datasets(self, train_dataset, eval_dataset=None):
+        """Prepare datasets in the right format for RLHF training."""
+        # This is a utility function to ensure datasets are in the right format for RLHF
+        
+        rlhf_datasets = {}
+        
+        if self.config.rlhf_method == "ppo":
+            # For PPO, we need reward data and prompt data
+            
+            # Check if we already have the right format
+            if isinstance(train_dataset, dict) and "reward" in train_dataset and "prompt" in train_dataset:
+                return train_dataset
+            
+            # Try to convert HF dataset to required format
+            if hasattr(train_dataset, "features") and "input" in train_dataset.features and "output" in train_dataset.features:
+                # Extract reward data
+                reward_data = train_dataset.select_columns(["input", "output", "score"]) if "score" in train_dataset.features else None
+                
+                # Extract prompt data
+                prompt_data = train_dataset.select_columns(["input"])
+                
+                rlhf_datasets["reward"] = reward_data
+                rlhf_datasets["prompt"] = prompt_data
+            else:
+                logger.warning("Dataset format not suitable for PPO training. Please provide datasets with 'input', 'output', and 'score' columns.")
+                
+        elif self.config.rlhf_method == "dpo":
+            # For DPO, we need preference data
+            
+            # Check if we already have the right format
+            if isinstance(train_dataset, dict) and "preference" in train_dataset:
+                return train_dataset
+            
+            # Try to convert HF dataset to required format
+            if hasattr(train_dataset, "features") and "input" in train_dataset.features and "chosen" in train_dataset.features and "rejected" in train_dataset.features:
+                # Dataset already has preference format
+                rlhf_datasets["preference"] = train_dataset
+            else:
+                logger.warning("Dataset format not suitable for DPO training. Please provide datasets with 'input', 'chosen', and 'rejected' columns.")
+        
+        return rlhf_datasets
+
+    def _create_advanced_training_config(self):
+        """Create config for advanced training features."""
+        from .advanced_training import AdvancedTrainingConfig
+        
+        # Extract relevant settings from main config
+        config = AdvancedTrainingConfig(
+            # Multi-node settings
+            use_multi_node=self.config.use_multi_node if hasattr(self.config, "use_multi_node") else False,
+            use_fsdp=self.config.use_fsdp if hasattr(self.config, "use_fsdp") else False,
+            num_nodes=self.config.num_nodes if hasattr(self.config, "num_nodes") else 1,
+            node_rank=self.config.node_rank if hasattr(self.config, "node_rank") else 0,
+            local_rank=self.config.local_rank if hasattr(self.config, "local_rank") else 0,
+            master_addr=self.config.master_addr if hasattr(self.config, "master_addr") else "localhost",
+            master_port=self.config.master_port if hasattr(self.config, "master_port") else "29500",
+            fsdp_sharding_strategy=self.config.fsdp_sharding_strategy if hasattr(self.config, "fsdp_sharding_strategy") else "full",
+            fsdp_cpu_offload=self.config.fsdp_cpu_offload if hasattr(self.config, "fsdp_cpu_offload") else False,
+            
+            # Unsloth settings
+            use_unsloth=self.config.use_unsloth if hasattr(self.config, "use_unsloth") else False,
+            unsloth_max_seq_length=self.config.unsloth_max_seq_length if hasattr(self.config, "unsloth_max_seq_length") else 2048,
+            
+            # RLHF settings
+            use_rlhf=self.config.use_rlhf if hasattr(self.config, "use_rlhf") else False,
+            rlhf_method=self.config.rlhf_method if hasattr(self.config, "rlhf_method") else "ppo",
+            reward_model_name=self.config.reward_model_name if hasattr(self.config, "reward_model_name") else None,
+            num_ppo_epochs=self.config.num_ppo_epochs if hasattr(self.config, "num_ppo_epochs") else 1,
+            kl_penalty_coefficient=self.config.kl_penalty_coefficient if hasattr(self.config, "kl_penalty_coefficient") else 0.1,
+            beta=self.config.beta if hasattr(self.config, "beta") else 0.1,
+        )
+        
+        return config
 
     def prepare_training_data(
         self,
@@ -906,13 +1074,9 @@ class FineTunePipeline:
         try:
             # Initialize trainer
             trainer = self._initialize_trainer(
+                model=self.model,
                 train_dataset=train_dataset,
-                eval_dataset=eval_dataset,
-                learning_rate=learning_rate,
-                num_train_epochs=num_epochs,
-                per_device_train_batch_size=batch_size,
-                per_device_eval_batch_size=batch_size,
-                **kwargs
+                eval_dataset=eval_dataset
             )
             
             # Apply curriculum learning if configured
@@ -1138,6 +1302,95 @@ class FineTunePipeline:
     def _initialize_model(self, config: FineTuneConfig):
         """Initialize model with optimizations for large models."""
         try:
+            # Apply model merging if enabled
+            if config.use_model_merging and len(config.merge_models) > 0:
+                logger.info(f"Performing model merging using {config.merge_method} method")
+                try:
+                    # Create merge configuration
+                    merge_config = ModelMergeConfig(
+                        base_model_name=config.model_name,
+                        secondary_model_names=config.merge_models,
+                        merge_method=config.merge_method,
+                        layer_weights=config.merge_weights if config.merge_weights else None,
+                        verify_compatibility=config.verify_merged_model
+                    )
+                    
+                    # Set up additional merge configs based on method
+                    if config.merge_method == "selective":
+                        merge_config.selective_layers = config.merge_layer_mapping
+                    elif config.merge_method == "frankenstein":
+                        merge_config.frankenstein_mapping = config.merge_layer_mapping
+                    
+                    # Perform merging
+                    merger = ModelMerger(merge_config)
+                    merged_model = merger.merge()
+                    
+                    logger.info("Model merging completed successfully")
+                    
+                    # Use merged model as our base model
+                    # We'll still apply other optimizations to it
+                    base_model = merged_model
+                except ImportError:
+                    logger.warning("Model merging module not available")
+                    # Continue with standard initialization
+                except Exception as e:
+                    logger.warning(f"Model merging failed: {str(e)}")
+                    logger.warning("Continuing with standard model initialization")
+            
+            # If advanced training is enabled, try to use the optimized model loading
+            if config.use_advanced_training and (config.use_unsloth or config.use_multi_node):
+                try:
+                    from .advanced_training import AdvancedTrainingConfig, AdvancedTrainingManager
+                    
+                    # Create advanced training config from our config
+                    advanced_config = AdvancedTrainingConfig(
+                        # Multi-node settings
+                        use_multi_node=config.use_multi_node,
+                        num_nodes=config.num_nodes,
+                        node_rank=config.node_rank,
+                        master_addr=config.master_addr,
+                        master_port=config.master_port,
+                        
+                        # Unsloth settings
+                        use_unsloth=config.use_unsloth,
+                        unsloth_max_seq_length=config.unsloth_max_seq_length,
+                        
+                        # RLHF settings (if enabled)
+                        use_rlhf=config.use_rlhf,
+                        rlhf_method=config.rlhf_method,
+                        reward_model_name=config.reward_model_name,
+                        num_ppo_epochs=config.num_ppo_epochs,
+                        kl_penalty_coefficient=config.kl_penalty_coefficient,
+                        beta=config.beta
+                    )
+                    
+                    # Create advanced training manager
+                    advanced_manager = AdvancedTrainingManager(advanced_config)
+                    
+                    # Try to get optimized model
+                    if config.use_unsloth:
+                        # Create PEFT config for Unsloth if needed
+                        peft_config = None
+                        if config.use_peft:
+                            peft_config = config  # Just pass our config
+                        
+                        # Try to get Unsloth optimized model
+                        result = advanced_manager.get_optimized_model(config.model_name, peft_config)
+                        if result:
+                            logger.info("Successfully loaded model with Unsloth optimizations")
+                            model, tokenizer = result
+                            self.tokenizer = tokenizer  # Update tokenizer
+                            
+                            # Store advanced training manager for later use
+                            self.advanced_manager = advanced_manager
+                            
+                            return model
+                except ImportError:
+                    logger.warning("Advanced training modules not available. Install with: pip install unsloth trl axolotl")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize advanced training: {str(e)}")
+            
+            # Standard model loading if advanced optimizations failed or not enabled
             # Determine model loading kwargs
             model_kwargs = {}
             
@@ -1219,35 +1472,40 @@ class FineTunePipeline:
                         )
                         model_kwargs["quantization_config"] = quantization_config
             
-            # Load base model
-            logger.info(f"Loading model: {config.model_name}")
-            if config.task_type == "text_classification":
-                model = AutoModelForSequenceClassification.from_pretrained(
-                    config.model_name,
-                    num_labels=self.num_labels,
-                    **model_kwargs
-                )
-            elif config.task_type == "token-classification":
-                model = AutoModelForTokenClassification.from_pretrained(
-                    config.model_name,
-                    num_labels=self.num_labels,
-                    **model_kwargs
-                )
-            elif config.task_type in ["summarization", "translation"]:
-                model = AutoModelForSeq2SeqLM.from_pretrained(
-                    config.model_name,
-                    **model_kwargs
-                )
-            elif config.task_type == "question-answering":
-                model = AutoModelForQuestionAnswering.from_pretrained(
-                    config.model_name,
-                    **model_kwargs
-                )
+            # Check if we have a merged model to use instead of loading from scratch
+            if config.use_model_merging and 'base_model' in locals():
+                logger.info("Using merged model as base model")
+                model = base_model
             else:
-                model = AutoModelForCausalLM.from_pretrained(
-                    config.model_name,
-                    **model_kwargs
-                )
+                # Load base model normally
+                logger.info(f"Loading model: {config.model_name}")
+                if config.task_type == "text_classification":
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        config.model_name,
+                        num_labels=self.num_labels,
+                        **model_kwargs
+                    )
+                elif config.task_type == "token-classification":
+                    model = AutoModelForTokenClassification.from_pretrained(
+                        config.model_name,
+                        num_labels=self.num_labels,
+                        **model_kwargs
+                    )
+                elif config.task_type in ["summarization", "translation"]:
+                    model = AutoModelForSeq2SeqLM.from_pretrained(
+                        config.model_name,
+                        **model_kwargs
+                    )
+                elif config.task_type == "question-answering":
+                    model = AutoModelForQuestionAnswering.from_pretrained(
+                        config.model_name,
+                        **model_kwargs
+                    )
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        config.model_name,
+                        **model_kwargs
+                    )
             
             # Enable Gradient Checkpointing if requested
             if config.use_gradient_checkpointing:
@@ -1375,7 +1633,6 @@ class FineTunePipeline:
                 
         except Exception as e:
             logger.error(f"Error initializing model: {str(e)}")
-            ErrorHandler.handle_error(e, "model_initialization")
             raise
     
     def _initialize_distillation(self):
@@ -1428,6 +1685,82 @@ class FineTunePipeline:
                 ErrorHandler.handle_error(e, "distillation_initialization")
                 return None
         return None
+
+    def fine_tune(self, train_dataset, eval_dataset=None):
+        """Fine-tune the model on the provided dataset."""
+        # Rest of existing code...
+        
+        # Apply RLHF training if enabled
+        if self.config.use_rlhf and hasattr(self, 'advanced_manager'):
+            logger.info(f"Applying RLHF training with {self.config.rlhf_method} method")
+            
+            try:
+                # For RLHF we need preference datasets
+                reward_dataset = self.prepare_rlhf_preference_dataset(train_dataset)
+                
+                # For PPO we also need a prompt dataset
+                prompt_dataset = None
+                if self.config.rlhf_method == "ppo":
+                    prompt_dataset = self.prepare_rlhf_prompt_dataset(train_dataset)
+                
+                # Apply RLHF
+                self.model = self.advanced_manager.apply_rlhf(
+                    self.model, 
+                    self.tokenizer, 
+                    reward_dataset, 
+                    prompt_dataset
+                )
+                
+                logger.info("RLHF training completed successfully")
+            except Exception as e:
+                logger.error(f"RLHF training failed: {str(e)}")
+        
+        # Rest of existing code...
+
+    def prepare_rlhf_preference_dataset(self, dataset):
+        """Prepare a preference dataset for RLHF training."""
+        # Simplified implementation - in a real application this would 
+        # convert your dataset to the format expected by TRL:
+        # {
+        #   "prompt": "User query", 
+        #   "chosen": "Good response", 
+        #   "rejected": "Bad response"
+        # }
+        logger.info("Preparing preference dataset for RLHF")
+        
+        # For demonstration purposes only - would need to be implemented based on data format
+        preference_data = []
+        for item in dataset:
+            # Example conversion - you'd need to adapt this to your actual data format
+            if "prompt" in item and "responses" in item and len(item["responses"]) >= 2:
+                preference_data.append({
+                    "prompt": item["prompt"],
+                    "chosen": item["responses"][0],  # Assuming first response is preferred
+                    "rejected": item["responses"][1]  # Assuming second response is less preferred
+                })
+        
+        return preference_data
+
+    def prepare_rlhf_prompt_dataset(self, dataset):
+        """Prepare a prompt dataset for PPO training."""
+        # Simplified implementation - in a real application this would
+        # extract prompts from your dataset for PPO generation
+        logger.info("Preparing prompt dataset for PPO")
+        
+        # For demonstration purposes only
+        prompt_data = []
+        for item in dataset:
+            if "prompt" in item:
+                prompt_data.append({"prompt": item["prompt"]})
+        
+        # Group prompts into batches
+        batch_size = min(8, len(prompt_data))
+        prompt_batches = []
+        for i in range(0, len(prompt_data), batch_size):
+            batch = prompt_data[i:i+batch_size]
+            prompt_batches.append(batch)
+        
+        return prompt_batches
 
 
 
