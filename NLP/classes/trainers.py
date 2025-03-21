@@ -14,14 +14,16 @@ import random
 import numpy as np
 import nltk
 from mlflow_callback import MLflowCallback
+from ..modules.trainer_customization import TrainerCustomizationMixin
 
 logger = logging.getLogger(__name__)
 
-class NLPTrainer(Trainer):
+class NLPTrainer(Trainer, TrainerCustomizationMixin):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, **kwargs):
+                model_init=None, callbacks=None, scheduler=None, 
+                customization_config=None, **kwargs):
 
         specs = json.load(open(args_dir, 'r'))
         self.specs = {**DEFAULT_SPECS, **specs}
@@ -51,9 +53,18 @@ class NLPTrainer(Trainer):
         # Check if this is a PEFT model before initializing
         self.is_peft_model = self._check_is_peft_model(model)
         
-        # Move optimizer initialization to configure_optimizers
-        self.optimizer = self.configure_optimizers()
+        # Initialize customization
+        self.setup_customization(customization_config)
         
+        # Initialize optimizer and scheduler
+        self.optimizer = self.configure_optimizers()
+        if isinstance(self.optimizer, dict):
+            optimizer = self.optimizer["optimizer"]
+            scheduler = self.optimizer["lr_scheduler"]["scheduler"]
+        else:
+            optimizer = self.optimizer
+            scheduler = None
+            
         # Initialize metrics based on task type
         self.metric = None
         if task_type in ["classification", "token-classification"]:
@@ -74,7 +85,7 @@ class NLPTrainer(Trainer):
                         train_dataset=train_dataset, 
                         eval_dataset=eval_dataset,
                         tokenizer=tokenizer, 
-                        optimizers=[self.optimizer, scheduler] if self.optimizer else None,
+                        optimizers=(optimizer, scheduler),
                         model_init=model_init, 
                         compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
@@ -454,12 +465,12 @@ class NLPTrainer(Trainer):
             ]))
             logger.debug(f"Gradient norm after clipping: {grad_norm}")
 
-class NLPSeq2SeqTrainer(Seq2SeqTrainer):
+class NLPSeq2SeqTrainer(Seq2SeqTrainer, TrainerCustomizationMixin):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
                 model_init=None, callbacks=None, scheduler=None, 
-                generation_config=None, **kwargs):
+                generation_config=None, customization_config=None, **kwargs):
 
         specs = json.load(open(args_dir, 'r'))
         self.specs = {**DEFAULT_SPECS, **specs}
@@ -494,8 +505,17 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
         # Check if this is a PEFT model before initializing
         self.is_peft_model = self._check_is_peft_model(model)
         
-        # Move optimizer initialization to configure_optimizers
+        # Initialize customization
+        self.setup_customization(customization_config)
+        
+        # Initialize optimizer and scheduler
         self.optimizer = self.configure_optimizers()
+        if isinstance(self.optimizer, dict):
+            optimizer = self.optimizer["optimizer"]
+            scheduler = self.optimizer["lr_scheduler"]["scheduler"]
+        else:
+            optimizer = self.optimizer
+            scheduler = None
         
         # Initialize metrics based on task type
         self.metric = None
@@ -523,7 +543,7 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
                         train_dataset=train_dataset, 
                         eval_dataset=eval_dataset,
                         tokenizer=tokenizer, 
-                        optimizers=[self.optimizer, scheduler] if self.optimizer else None,
+                        optimizers=(optimizer, scheduler),
                         model_init=model_init, 
                         compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)

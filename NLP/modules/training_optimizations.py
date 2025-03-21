@@ -9,10 +9,12 @@ Key features include:
 - Smart data prefetching
 - Model pruning capabilities
 - Memory monitoring and optimization
+- Hardware-aware automatic optimization selection
 """
 
 import logging
 import gc
+import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Union, Tuple, Callable
 import torch
@@ -26,10 +28,37 @@ import GPUtil
 from functools import partial
 from torch.utils.data.sampler import BatchSampler
 from collections import deque
+from datetime import datetime
+import platform
 
 from .mlflow_tracking import MLflowTracker
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training_optimizations.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
+
+@dataclass
+class HardwareSpecs:
+    """Hardware specifications for optimization decisions."""
+    gpu_name: Optional[str] = None
+    gpu_memory: Optional[int] = None  # in GB
+    gpu_count: int = 0
+    cpu_count: int = 0
+    total_ram: int = 0  # in GB
+    cuda_available: bool = False
+    cuda_version: Optional[str] = None
+    compute_capability: Optional[float] = None
+    is_ampere_or_newer: bool = False
+    is_ampere: bool = False
+    is_hopper: bool = False
+    is_ada_lovelace: bool = False
 
 @dataclass
 class OptimizationConfig:
@@ -50,6 +79,8 @@ class OptimizationConfig:
         pruning_amount: Amount of weights to prune
         prefetch_factor: Number of batches to prefetch
         mlflow_tracking: Whether to track metrics with MLflow
+        hardware_specs: Hardware specifications for optimization decisions
+        auto_optimize: Whether to automatically select optimizations based on hardware
     """
     enable_mixed_precision: bool = True
     mixed_precision_dtype: str = "fp16"  # or "bf16"
@@ -65,6 +96,67 @@ class OptimizationConfig:
     pruning_amount: float = 0.3
     prefetch_factor: int = 2
     mlflow_tracking: bool = True
+    hardware_specs: Optional[HardwareSpecs] = None
+    auto_optimize: bool = True
+
+    def __post_init__(self):
+        if self.auto_optimize:
+            self._auto_configure_optimizations()
+
+    def _auto_configure_optimizations(self):
+        """Automatically configure optimizations based on hardware specs."""
+        if not self.hardware_specs:
+            self.hardware_specs = self._detect_hardware()
+        
+        specs = self.hardware_specs
+        
+        # Memory Efficiency Optimizations
+        if specs.gpu_memory and specs.gpu_memory < 32:
+            self.enable_gradient_checkpointing = True
+            self.enable_dynamic_batching = True
+            self.target_batch_size = min(16, self.target_batch_size)
+            self.max_batch_size = min(64, self.max_batch_size)
+        
+        # Parallelism Optimizations
+        if specs.gpu_count > 1:
+            self.enable_smart_prefetching = True
+            self.prefetch_factor = max(2, specs.gpu_count)
+        
+        # Data Optimization
+        if specs.total_ram < 64:
+            self.enable_dynamic_batching = True
+            self.memory_threshold = 0.75  # More conservative threshold
+        
+        # Computation Optimization
+        if specs.is_ampere_or_newer:
+            self.enable_mixed_precision = True
+            self.mixed_precision_dtype = "bf16" if specs.is_hopper else "fp16"
+    
+    @staticmethod
+    def _detect_hardware() -> HardwareSpecs:
+        """Detect hardware specifications."""
+        specs = HardwareSpecs()
+        
+        # CPU and RAM info
+        specs.cpu_count = psutil.cpu_count()
+        specs.total_ram = psutil.virtual_memory().total // (1024**3)  # Convert to GB
+        
+        # GPU info
+        specs.cuda_available = torch.cuda.is_available()
+        if specs.cuda_available:
+            specs.gpu_count = torch.cuda.device_count()
+            specs.gpu_name = torch.cuda.get_device_name(0)
+            specs.gpu_memory = torch.cuda.get_device_properties(0).total_memory // (1024**3)  # Convert to GB
+            specs.cuda_version = torch.version.cuda
+            specs.compute_capability = torch.cuda.get_device_capability(0)[0] + torch.cuda.get_device_capability(0)[1] / 10
+            
+            # Check GPU architecture
+            specs.is_ampere_or_newer = specs.compute_capability >= 8.0
+            specs.is_ampere = 8.0 <= specs.compute_capability < 9.0
+            specs.is_hopper = 9.0 <= specs.compute_capability < 10.0
+            specs.is_ada_lovelace = specs.compute_capability >= 10.0
+        
+        return specs
 
 class MemoryTracker:
     """Tracks GPU and CPU memory usage."""
@@ -242,6 +334,64 @@ class ModelPruner:
                     elif self.config.pruning_method == "movement":
                         param.data = self._movement_pruning(param.data, name)
 
+class OptimizationMetrics:
+    """Metrics for tracking optimization effectiveness."""
+    def __init__(self):
+        self.gpu_memory_usage: float = 0.0
+        self.cpu_memory_usage: float = 0.0
+        self.training_speed: float = 0.0
+        self.batch_processing_time: float = 0.0
+        self.optimization_effectiveness: float = 0.0
+        self.timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict:
+        return {
+            'gpu_memory_usage': self.gpu_memory_usage,
+            'cpu_memory_usage': self.cpu_memory_usage,
+            'training_speed': self.training_speed,
+            'batch_processing_time': self.batch_processing_time,
+            'optimization_effectiveness': self.optimization_effectiveness,
+            'timestamp': self.timestamp
+        }
+
+class MetricsTracker:
+    """Tracks and logs optimization metrics."""
+    def __init__(self):
+        self.metrics_history: List[OptimizationMetrics] = []
+        self.start_time = time.time()
+        self.last_batch_time = time.time()
+
+    def update_metrics(self, metrics: OptimizationMetrics):
+        """Update and log metrics."""
+        self.metrics_history.append(metrics)
+        logger.info(f"Optimization Metrics: {metrics.to_dict()}")
+        
+        # Log significant changes
+        if len(self.metrics_history) > 1:
+            prev_metrics = self.metrics_history[-2]
+            if abs(metrics.gpu_memory_usage - prev_metrics.gpu_memory_usage) > 0.1:
+                logger.warning(f"Significant GPU memory change: {prev_metrics.gpu_memory_usage:.2f} -> {metrics.gpu_memory_usage:.2f}")
+
+    def get_metrics_summary(self) -> Dict:
+        """Get summary of metrics history."""
+        if not self.metrics_history:
+            return {}
+        
+        latest = self.metrics_history[-1]
+        return {
+            'current_metrics': latest.to_dict(),
+            'history_length': len(self.metrics_history),
+            'training_duration': time.time() - self.start_time
+        }
+
+    def log_batch_completion(self, batch_size: int):
+        """Log batch processing completion."""
+        current_time = time.time()
+        batch_time = current_time - self.last_batch_time
+        self.last_batch_time = current_time
+        
+        logger.info(f"Batch completed: size={batch_size}, time={batch_time:.2f}s")
+
 class TrainingOptimizer:
     """Main class for managing training optimizations."""
     
@@ -254,6 +404,7 @@ class TrainingOptimizer:
         self.config = config
         self.memory_tracker = MemoryTracker()
         self.mlflow_tracker = MLflowTracker("training_optimizations") if config.mlflow_tracking else None
+        self.metrics_tracker = MetricsTracker()
         
         if config.enable_mixed_precision:
             self.scaler = amp.GradScaler()
@@ -339,3 +490,163 @@ class TrainingOptimizer:
         stats.update(self.memory_tracker.get_gpu_memory_info())
         stats.update(self.memory_tracker.get_cpu_memory_info())
         return stats 
+
+    def get_optimization_metrics(self) -> OptimizationMetrics:
+        """Get current optimization metrics."""
+        metrics = OptimizationMetrics(
+            gpu_memory_usage=self._get_gpu_memory_usage(),
+            cpu_memory_usage=self._get_cpu_memory_usage(),
+            training_speed=self._calculate_training_speed(),
+            batch_processing_time=self._get_batch_processing_time(),
+            optimization_effectiveness=self._calculate_optimization_effectiveness()
+        )
+        self.metrics_tracker.update_metrics(metrics)
+        return metrics
+
+    def _get_gpu_memory_usage(self) -> float:
+        """Get current GPU memory usage percentage."""
+        if torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() * 100
+        return 0.0
+
+    def _get_cpu_memory_usage(self) -> float:
+        """Get current CPU memory usage percentage."""
+        return psutil.Process().memory_percent()
+
+    def _calculate_training_speed(self) -> float:
+        """Calculate current training speed in samples per second."""
+        if not self.metrics_tracker.metrics_history:
+            return 0.0
+        return self.metrics_tracker.metrics_history[-1].training_speed
+
+    def _get_batch_processing_time(self) -> float:
+        """Get average batch processing time."""
+        if not self.metrics_tracker.metrics_history:
+            return 0.0
+        return self.metrics_tracker.metrics_history[-1].batch_processing_time
+
+    def _calculate_optimization_effectiveness(self) -> float:
+        """Calculate optimization effectiveness score."""
+        # Implementation depends on specific metrics
+        return 0.0  # Placeholder
+
+class HardwareAwareOptimizer(TrainingOptimizer):
+    """Enhanced training optimizer with hardware-aware optimizations."""
+    
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        config: OptimizationConfig
+    ):
+        super().__init__(model, config)
+        self.hardware_specs = config.hardware_specs or OptimizationConfig._detect_hardware()
+        self._apply_hardware_optimizations()
+        logger.info("HardwareAwareOptimizer initialized with optimizations")
+    
+    def _apply_hardware_optimizations(self):
+        """Apply hardware-specific optimizations."""
+        specs = self.hardware_specs
+        
+        # Memory Efficiency
+        if specs.gpu_memory and specs.gpu_memory < 32:
+            self._apply_memory_efficiency_optimizations()
+        
+        # Parallelism
+        if specs.gpu_count > 1:
+            self._apply_parallelism_optimizations()
+        
+        # Data Optimization
+        if specs.total_ram < 64:
+            self._apply_data_optimizations()
+        
+        # Computation Optimization
+        if specs.is_ampere_or_newer:
+            self._apply_computation_optimizations()
+    
+    def _apply_memory_efficiency_optimizations(self):
+        """Apply memory efficiency optimizations."""
+        specs = self.hardware_specs
+        if specs.gpu_memory and specs.gpu_memory < 32:
+            # Enable gradient checkpointing
+            self.model.gradient_checkpointing_enable()
+            
+            # Adjust batch sizes
+            self.config.target_batch_size = min(16, self.config.target_batch_size)
+            self.config.max_batch_size = min(64, self.config.max_batch_size)
+            
+            # Enable dynamic batching
+            self.config.enable_dynamic_batching = True
+    
+    def _apply_parallelism_optimizations(self):
+        """Apply parallelism optimizations."""
+        specs = self.hardware_specs
+        if specs.gpu_count > 1:
+            # Enable smart prefetching
+            self.config.enable_smart_prefetching = True
+            self.config.prefetch_factor = max(2, specs.gpu_count)
+            
+            # Enable data parallel
+            self.model = nn.DataParallel(self.model)
+    
+    def _apply_data_optimizations(self):
+        """Apply data optimization techniques."""
+        specs = self.hardware_specs
+        if specs.total_ram < 64:
+            # Enable dynamic batching
+            self.config.enable_dynamic_batching = True
+            self.config.memory_threshold = 0.75
+            
+            # Enable memory mapping
+            self.config.enable_smart_prefetching = True
+    
+    def _apply_computation_optimizations(self):
+        """Apply computation optimizations."""
+        specs = self.hardware_specs
+        if specs.is_ampere_or_newer:
+            # Enable mixed precision
+            self.config.enable_mixed_precision = True
+            self.config.mixed_precision_dtype = "bf16" if specs.is_hopper else "fp16"
+            
+            # Enable flash attention if available
+            if hasattr(self.model, "enable_flash_attention"):
+                self.model.enable_flash_attention()
+    
+    def get_optimization_summary(self) -> str:
+        """Get a human-readable summary of applied optimizations."""
+        specs = self.hardware_specs
+        summary = [
+            "Hardware-Aware Optimization Summary",
+            "=" * 40,
+            f"Hardware Specifications:",
+            f"- GPU: {specs.gpu_name}",
+            f"- Memory: {specs.gpu_memory}GB",
+            f"- CUDA: {specs.cuda_version}",
+            "",
+            "Applied Optimizations:",
+            f"- Memory Efficiency: {self._get_memory_efficiency_summary()}",
+            f"- Parallelism: {self._get_parallelism_summary()}",
+            f"- Data Optimization: {self._get_data_optimization_summary()}",
+            f"- Computation: {self._get_computation_summary()}",
+            "",
+            "Current Metrics:",
+            f"- GPU Memory Usage: {self._get_gpu_memory_usage():.2f}%",
+            f"- Training Speed: {self._calculate_training_speed():.2f} samples/s",
+            f"- Optimization Effectiveness: {self._calculate_optimization_effectiveness():.2f}%"
+        ]
+        return "\n".join(summary)
+
+    def _get_memory_efficiency_summary(self) -> str:
+        """Get memory efficiency optimization summary."""
+        return f"Enabled (Threshold: {self.config.memory_threshold})"
+
+    def _get_parallelism_summary(self) -> str:
+        """Get parallelism optimization summary."""
+        return f"Enabled (GPUs: {self.config.hardware_specs.gpu_count})"
+
+    def _get_data_optimization_summary(self) -> str:
+        """Get data optimization summary."""
+        return f"Enabled (Batch Size: {self.config.target_batch_size})"
+
+    def _get_computation_summary(self) -> str:
+        """Get computation optimization summary."""
+        return f"Enabled (Mixed Precision: {self.config.mixed_precision_dtype})" 

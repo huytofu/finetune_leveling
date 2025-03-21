@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 from configs.default_config import DEFAULT_SPECS
 from .config_manager import ConfigManager
 from .utils import Logger, ErrorHandler
+from ..modules.trainer_customization import TrainerCustomizationMixin
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -87,7 +88,7 @@ p.add('--max_grad_norm', type=float, help='Maximum gradient norm', default=1.0)
 # Parse arguments
 args = p.parse_args()
 
-class AcceleratedNLPTrainer():
+class AcceleratedNLPTrainer(TrainerCustomizationMixin):
     """
     A trainer class for NLP models using the Hugging Face Accelerate library.
     
@@ -117,7 +118,8 @@ class AcceleratedNLPTrainer():
     """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
-                task_type, optimizer=None, chosen_metric=None):
+                task_type, optimizer=None, chosen_metric=None, 
+                customization_config=None):
         """
         Initialize the AcceleratedNLPTrainer.
         
@@ -132,28 +134,54 @@ class AcceleratedNLPTrainer():
             task_type (str): The type of task (e.g., classification, generation)
             optimizer: The optimizer for training
             chosen_metric (str): The metric for evaluation
+            customization_config: Configuration for trainer customization
         """
         try:
+            # Load configuration specifications
+            specs = json.load(open(args_dir, 'r'))
+            self.specs = {**DEFAULT_SPECS, **specs}
+            
+            # Store model and data components
             self.model = model
-            self.optimizer = optimizer
-            self.data_collator = data_collator
-            self.datasets = {"train": train_dataset, "eval": eval_dataset}
-            self.raw_dataset = raw_dataset
             self.tokenizer = tokenizer
+            self.data_collator = data_collator
+            self.task_type = task_type
+            self.chosen_metric = chosen_metric
+            
+            # Initialize Accelerator
+            self.accelerator = Accelerator(
+                gradient_accumulation_steps=self.specs.get('gradient_accumulation_steps', 1),
+                mixed_precision=self.specs.get('fp16', True) and 'fp16' or 'no'
+            )
+            
+            # Check if this is a PEFT model before initializing
+            self.is_peft_model = self._check_is_peft_model(model)
+            
+            # Initialize customization
+            self.setup_customization(customization_config)
+            
+            # Initialize optimizer and scheduler
+            self.optimizer = self.configure_optimizers()
+            if isinstance(self.optimizer, dict):
+                self.optimizer = self.optimizer["optimizer"]
+                self.scheduler = self.optimizer["lr_scheduler"]["scheduler"]
+            else:
+                self.scheduler = None
+            
+            # Prepare datasets and model with Accelerator
+            self.train_dataset, self.eval_dataset = self.prepare_with_accelerator(train_dataset, eval_dataset)
+            self.raw_dataset = raw_dataset
+            
+            # Initialize metrics
+            self.losses = []
+            self.current_loss = 0
+            self.best_metric = float('inf')
+            self.no_improvement_count = 0
             
             self.setup_configuration()
-            self.is_peft_model = self._check_is_peft_model(model)
             self.peft_config = self._get_peft_config() if self.is_peft_model else None
             
-            self.optimizer = self.configure_optimizers()
-            
-            self.prepare_with_accelerator(train_dataset, eval_dataset)
-            self.prepare_scheduler()
-
             self.progress_bar = tqdm(range(self.num_training_steps))
-            self.task_type = task_type
-            self.losses = []
-            self.metric = evaluate.load(chosen_metric)
             
             self._setup_gradient_accumulation()
             
@@ -883,12 +911,21 @@ class AcceleratedNLPTrainer():
 class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
-                task_type, optimizer=None, chosen_metric=None):
+                task_type, optimizer=None, chosen_metric=None, 
+                generation_config=None, customization_config=None):
         super().__init__(args_dir, model, tokenizer, 
                         data_collator, train_dataset, eval_dataset, raw_dataset,
-                        task_type, optimizer, chosen_metric)
-        self.setup_seq2seq_config()
-        
+                        task_type, optimizer, chosen_metric, 
+                        customization_config)
+                        
+        # Setup generation config
+        self.generation_config = generation_config or GenerationConfig(
+            max_length=self.specs.get("max_length", 128),
+            num_beams=self.specs.get("num_beams", 4),
+            length_penalty=self.specs.get("length_penalty", 1.0),
+            early_stopping=self.specs.get("early_stopping", True)
+        )
+
     def setup_seq2seq_config(self):
         """Setup specialized configuration for seq2seq training"""
         self.teacher_forcing_ratio = self.specs.get('teacher_forcing_ratio', 0.5)

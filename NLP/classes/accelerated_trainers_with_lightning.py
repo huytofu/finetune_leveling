@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 from configs.default_config import DEFAULT_SPECS
 from .config_manager import ConfigManager
 from .utils import Logger, ErrorHandler
+from ..modules.trainer_customization import TrainerCustomizationMixin
 
 
 # Set up logging
@@ -50,11 +51,12 @@ p.add('--max_grad_norm', type=float, help='Maximum gradient norm', default=1.0)
 # Parse arguments
 args = p.parse_args()
 
-class AcceleratedNLPTrainer(pl.LightningModule):
+class AcceleratedNLPTrainer(pl.LightningModule, TrainerCustomizationMixin):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, **kwargs):
+                model_init=None, callbacks=None, scheduler=None, 
+                customization_config=None, **kwargs):
         super().__init__()
         try:
             self.model = model
@@ -77,6 +79,9 @@ class AcceleratedNLPTrainer(pl.LightningModule):
             # PEFT detection and configuration
             self.is_peft_model = self._check_is_peft_model()
             self._setup_peft_config()
+            
+            # Setup customization
+            self.setup_customization(customization_config)
             
             self.save_hyperparameters(ignore=['model', 'tokenizer', 'data_collator'])
             Logger.info("AcceleratedNLPTrainer initialized successfully.")
@@ -233,7 +238,16 @@ class AcceleratedNLPTrainer(pl.LightningModule):
         # Forward pass with Accelerator's autocast
         with self.accelerator.autocast():
             outputs = self.model(**batch)
-            loss = outputs.loss
+            loss = outputs.loss if not isinstance(outputs, tuple) else outputs[0]
+
+        # Get loss function from customization or use model's loss
+        loss_fn = self.get_loss_function()
+        if loss_fn and not isinstance(outputs, tuple):
+            # Apply custom loss function if provided and outputs format allows
+            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            labels = batch.get('labels')
+            if labels is not None:
+                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         # Handle gradients
         loss = self._handle_gradients(loss)
@@ -249,14 +263,26 @@ class AcceleratedNLPTrainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step with metric computation"""
+        """Validation step with customization support"""
         outputs = self.model(**batch)
-        val_loss = outputs.loss
+        val_loss = outputs.loss if not isinstance(outputs, tuple) else outputs[0]
+
+        # Get loss function from customization or use model's loss
+        loss_fn = self.get_loss_function()
+        if loss_fn and not isinstance(outputs, tuple):
+            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            labels = batch.get('labels')
+            if labels is not None:
+                val_loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        # Log validation metrics
         self.log('val_loss', val_loss, prog_bar=True, sync_dist=True)
         
-        # Handle predictions
-        predictions = self.handle_predictions(outputs)
-        return {'loss': val_loss, 'predictions': predictions, 'labels': batch['labels']}
+        # Check early stopping if configured
+        if self.should_stop_training({'val_loss': val_loss.item()}):
+            self.trainer.should_stop = True
+
+        return val_loss
 
     def validation_epoch_end(self, outputs):
         all_predictions = [x['predictions'] for x in outputs]
@@ -611,13 +637,54 @@ class AcceleratedNLPTrainer(pl.LightningModule):
 
 class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
     def __init__(self, args_dir, model, tokenizer, 
-                data_collator, train_dataset, eval_dataset, 
+                data_collator, train_dataset, eval_dataset, raw_dataset,
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, **kwargs):
-        super().__init__(args_dir, model, tokenizer, 
-                        data_collator, train_dataset, eval_dataset,
-                        task_type, optimizer, compute_metrics,
-                        model_init, callbacks, scheduler, **kwargs)
+                model_init=None, callbacks=None, scheduler=None,
+                customization_config=None, generation_config=None, **kwargs):
+        super().__init__(args_dir, model, tokenizer, data_collator, train_dataset, 
+                        eval_dataset, raw_dataset, task_type, optimizer, compute_metrics,
+                        model_init, callbacks, scheduler, customization_config, **kwargs)
+        self.generation_config = generation_config or GenerationConfig()
+
+    def validation_step(self, batch, batch_idx):
+        """Validation step with sequence generation and customization support"""
+        outputs = self.model(**batch)
+        val_loss = outputs.loss if not isinstance(outputs, tuple) else outputs[0]
+
+        # Get loss function from customization or use model's loss
+        loss_fn = self.get_loss_function()
+        if loss_fn and not isinstance(outputs, tuple):
+            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            labels = batch.get('labels')
+            if labels is not None:
+                val_loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        # Generate sequences for evaluation
+        if self.chosen_metric:
+            generated_tokens = self.model.generate(
+                batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                **self.generation_config.to_dict(),
+            )
+            
+            # Decode generated tokens and labels
+            decoded_preds = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            labels = batch["labels"]
+            labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
+            decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+            
+            # Compute metrics
+            metrics = self.chosen_metric(decoded_preds, decoded_labels)
+            self.log_dict(metrics, prog_bar=True, sync_dist=True)
+
+        # Log validation loss
+        self.log('val_loss', val_loss, prog_bar=True, sync_dist=True)
+        
+        # Check early stopping if configured
+        if self.should_stop_training({'val_loss': val_loss.item()}):
+            self.trainer.should_stop = True
+
+        return val_loss
 
     def setup_generation_config(self):
         """Set up generation configuration with PEFT awareness"""
@@ -660,34 +727,6 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             self.specs['per_device_eval_batch_size'] = min(
                 4, self.specs['per_device_eval_batch_size']
             )
-
-    def validation_step(self, batch, batch_idx):
-        """Specialized validation step for seq2seq models"""
-        # Use Accelerator's autocast for mixed precision
-        with self.accelerator.autocast():
-            outputs = self.model(**batch)
-            val_loss = outputs.loss
-            
-            # Generate sequences
-            generated_ids = self.generate(batch)
-            
-        # Process outputs
-        generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-        
-        # Get reference texts
-        if isinstance(batch['labels'], torch.Tensor):
-            labels = self.tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
-        else:
-            labels = batch['labels']
-            
-        # Log metrics
-        self.log('val_loss', val_loss, prog_bar=True, sync_dist=True)
-        
-        return {
-            'loss': val_loss,
-            'predictions': generated_texts,
-            'labels': labels
-        }
 
     def generate(self, batch):
         """Generate sequences with PEFT and Accelerator awareness"""

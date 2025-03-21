@@ -13,6 +13,7 @@ from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationC
 from configs.default_config import DEFAULT_SPECS
 from torch.utils.data import DataLoader
 import random
+from ..modules.trainer_customization import TrainerCustomizationMixin
 
 @dataclass
 class PeftConfig:
@@ -91,7 +92,7 @@ class PeftConfig:
             use_cache=False
         )
 
-class NLPTrainer(pl.LightningModule):
+class NLPTrainer(pl.LightningModule, TrainerCustomizationMixin):
     """
     A PyTorch Lightning trainer class for NLP models.
     
@@ -129,7 +130,8 @@ class NLPTrainer(pl.LightningModule):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, **kwargs):
+                model_init=None, callbacks=None, scheduler=None, 
+                customization_config=None, **kwargs):
         """
         Initialize the NLPTrainer.
         
@@ -146,6 +148,7 @@ class NLPTrainer(pl.LightningModule):
             model_init: Function to initialize the model (optional)
             callbacks: List of callbacks to apply during training (optional)
             scheduler: Learning rate scheduler (optional)
+            customization_config: Configuration for customization (optional)
             **kwargs: Additional keyword arguments
         """
         super().__init__()
@@ -168,6 +171,9 @@ class NLPTrainer(pl.LightningModule):
         # Add PEFT detection and configuration
         self.is_peft_model = self._check_is_peft_model(model)
         self.peft_config = self._get_peft_config() if self.is_peft_model else None
+        
+        # Initialize customization
+        self.setup_customization(customization_config)
         
         # Set flags for Lightning and Accelerate integration
         self.use_lightning = True
@@ -685,30 +691,17 @@ class NLPSeq2SeqTrainer(NLPTrainer):
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, **kwargs):
+                model_init=None, callbacks=None, scheduler=None, 
+                generation_config=None, customization_config=None, **kwargs):
         """
         Initialize the NLPSeq2SeqTrainer.
-        
-        Args:
-            args_dir (str): Directory containing configuration arguments.
-            model: The model to be trained.
-            tokenizer: The tokenizer for text processing.
-            data_collator: The data collator for batching.
-            train_dataset: The training dataset.
-            eval_dataset: The evaluation dataset.
-            task_type (str): The type of task (e.g., translation, summarization).
-            optimizer: The optimizer for training.
-            compute_metrics: Function to compute metrics during evaluation.
-            model_init: Function to initialize the model.
-            callbacks: List of callbacks to apply during training.
-            scheduler: Learning rate scheduler.
-            **kwargs: Additional keyword arguments.
         """
         super().__init__(args_dir, model, tokenizer, 
                         data_collator, train_dataset, eval_dataset, 
                         task_type, optimizer, compute_metrics,
-                        model_init, callbacks, scheduler, **kwargs)
-
+                        model_init, callbacks, scheduler, 
+                        customization_config, **kwargs)
+                        
         # Setup specialized configuration for seq2seq training
         self.setup_seq2seq_config()
         
