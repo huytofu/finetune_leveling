@@ -3,6 +3,9 @@ import sys
 import json
 import logging
 from typing import Optional, Dict, Any, Union, List
+import torch
+import nltk
+import numpy as np
 from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationConfig
 
 # Add to Python path
@@ -24,6 +27,7 @@ from modules.customizations_and_optimizations.trainer_utils import (
     get_default_metrics,
     optimize_memory_settings
 )
+from modules.managers.checkpoint_manager import CheckpointManager
 
 logger = logging.getLogger(__name__)
 

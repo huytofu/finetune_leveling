@@ -3,11 +3,11 @@ import sys
 import json
 import logging
 import random
+from typing import Optional, List, Dict, Any
 import evaluate
 import pytorch_lightning as pl
 import torch
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
 from torch.utils.data import DataLoader
 from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationConfig
 
