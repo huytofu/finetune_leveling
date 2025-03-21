@@ -247,18 +247,18 @@ class NLPTrainer(Trainer):
                 loss = loss * 1.2
 
         # Apply gradient clipping
-        if self.args.max_grad_norm > 0:
+        if self.specs.get('max_grad_norm', 0) > 0:
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             if hasattr(self.model, "peft_config"):
                 peft_type = self.model.peft_config.peft_type
                 if peft_type == "LORA":
                     # More aggressive clipping for LoRA
-                    max_grad_norm = self.args.max_grad_norm * 1.5
+                    max_grad_norm = self.specs['max_grad_norm'] * 0.8
                 elif "PREFIX" in peft_type:
                     # More conservative clipping for prefix tuning
-                    max_grad_norm = self.args.max_grad_norm * 0.8
+                    max_grad_norm = self.specs['max_grad_norm'] * 1.2
                 else:
-                    max_grad_norm = self.args.max_grad_norm
+                    max_grad_norm = self.specs['max_grad_norm']
                     
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
 
@@ -291,7 +291,7 @@ class NLPTrainer(Trainer):
             self._scale_gradients()
             
             # Log gradient norms in debug mode
-            if self.args.debug:
+            if self.specs.get('debug_gradients', False):
                 trainable_params = [p for p in model.parameters() if p.requires_grad]
                 grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params]))
                 self.log({"gradient_norm": grad_norm})
@@ -412,6 +412,47 @@ class NLPTrainer(Trainer):
             model=self.model,
             checkpoint_path=checkpoint_path
         )
+
+    def clip_gradients(self, parameters=None):
+        """
+        Apply PEFT-aware gradient clipping.
+        
+        Args:
+            parameters: Optional list of parameters to clip. If None, uses all model parameters.
+        """
+        if not self.specs.get('max_grad_norm', 0) > 0:
+            return
+            
+        if parameters is None:
+            parameters = self.model.parameters()
+            
+        # Get PEFT-specific clipping configuration
+        if self.is_peft_model and hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # More aggressive clipping for LoRA to prevent instability
+                max_grad_norm = self.specs['max_grad_norm'] * 0.8
+                logger.info(f"Applying LoRA-specific gradient clipping with norm {max_grad_norm}")
+            elif "PREFIX" in peft_type:
+                # Less aggressive clipping for prefix tuning
+                max_grad_norm = self.specs['max_grad_norm'] * 1.2
+                logger.info(f"Applying Prefix-specific gradient clipping with norm {max_grad_norm}")
+            else:
+                max_grad_norm = self.specs['max_grad_norm']
+        else:
+            max_grad_norm = self.specs['max_grad_norm']
+            
+        # Apply clipping
+        torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+        
+        if self.specs.get('debug_gradients', False):
+            # Log gradient norms for debugging
+            grad_norm = torch.norm(torch.stack([
+                torch.norm(p.grad.detach()) 
+                for p in parameters 
+                if p.grad is not None
+            ]))
+            logger.debug(f"Gradient norm after clipping: {grad_norm}")
 
 class NLPSeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(self, args_dir, model, tokenizer, 
@@ -662,7 +703,7 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
             return (outputs.loss, generation_outputs, inputs["labels"])
             
         # Standard loss computation for training
-        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+        return super().prediction_step(model, inputs, prediction_loss_loss_only, ignore_keys)
 
     def _get_generation_kwargs(self):
         """Get optimized generation kwargs based on task type."""
@@ -683,3 +724,73 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
             })
             
         return kwargs
+
+    def clip_gradients(self, parameters=None):
+        """
+        Apply PEFT-aware gradient clipping with seq2seq-specific adjustments.
+        
+        Args:
+            parameters: Optional list of parameters to clip. If None, uses all model parameters.
+        """
+        if not self.specs.get('max_grad_norm', 0) > 0:
+            return
+            
+        if parameters is None:
+            # For seq2seq, separate encoder and decoder parameters
+            encoder_params = []
+            decoder_params = []
+            shared_params = []
+            
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if 'encoder' in name:
+                    encoder_params.append(param)
+                elif 'decoder' in name:
+                    decoder_params.append(param)
+                else:
+                    shared_params.append(param)
+            
+            # Get PEFT-specific clipping configuration
+            if self.is_peft_model and hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # Different clipping for encoder/decoder in LoRA
+                    encoder_norm = self.specs['max_grad_norm'] * 0.7
+                    decoder_norm = self.specs['max_grad_norm'] * 0.9
+                    shared_norm = self.specs['max_grad_norm'] * 0.8
+                elif "PREFIX" in peft_type:
+                    # Different clipping for prefix tuning
+                    encoder_norm = self.specs['max_grad_norm'] * 1.1
+                    decoder_norm = self.specs['max_grad_norm'] * 1.3
+                    shared_norm = self.specs['max_grad_norm'] * 1.2
+                else:
+                    encoder_norm = decoder_norm = shared_norm = self.specs['max_grad_norm']
+            else:
+                encoder_norm = decoder_norm = shared_norm = self.specs['max_grad_norm']
+            
+            # Apply clipping to each parameter group
+            if encoder_params:
+                torch.nn.utils.clip_grad_norm_(encoder_params, encoder_norm)
+            if decoder_params:
+                torch.nn.utils.clip_grad_norm_(decoder_params, decoder_norm)
+            if shared_params:
+                torch.nn.utils.clip_grad_norm_(shared_params, shared_norm)
+                
+            if self.specs.get('debug_gradients', False):
+                # Log gradient norms for debugging
+                for name, params, norm in [
+                    ('encoder', encoder_params, encoder_norm),
+                    ('decoder', decoder_params, decoder_norm),
+                    ('shared', shared_params, shared_norm)
+                ]:
+                    if params:
+                        grad_norm = torch.norm(torch.stack([
+                            torch.norm(p.grad.detach()) 
+                            for p in params 
+                            if p.grad is not None
+                        ]))
+                        logger.debug(f"{name} gradient norm after clipping: {grad_norm} (max: {norm})")
+        else:
+            # If parameters are provided, use parent implementation
+            super().clip_gradients(parameters)

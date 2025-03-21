@@ -839,6 +839,46 @@ class AcceleratedNLPTrainer():
     def print_trainer_type(self):
         print("I am an AcceleratedNLPTrainer!")
 
+    def clip_gradients(self, parameters=None):
+        """
+        Apply PEFT-aware gradient clipping with Accelerator integration.
+        
+        Args:
+            parameters: Optional list of parameters to clip. If None, uses all model parameters.
+        """
+        if not self.specs.get('max_grad_norm', 0) > 0:
+            return
+            
+        if parameters is None:
+            parameters = self.model.parameters()
+            
+        # Get PEFT-specific clipping configuration
+        if self.is_peft_model and hasattr(self.model, "peft_config"):
+            peft_type = self.model.peft_config.peft_type
+            if peft_type == "LORA":
+                # More aggressive clipping for LoRA to prevent instability
+                max_grad_norm = self.specs['max_grad_norm'] * 0.8
+                logger.info(f"Applying LoRA-specific gradient clipping with norm {max_grad_norm}")
+            elif "PREFIX" in peft_type:
+                # Less aggressive clipping for prefix tuning
+                max_grad_norm = self.specs['max_grad_norm'] * 1.2
+                logger.info(f"Applying Prefix-specific gradient clipping with norm {max_grad_norm}")
+            else:
+                max_grad_norm = self.specs['max_grad_norm']
+        else:
+            max_grad_norm = self.specs['max_grad_norm']
+            
+        # Apply clipping using Accelerator's method
+        self.accelerator.clip_grad_norm_(parameters, max_grad_norm)
+        
+        if self.specs.get('debug_gradients', False):
+            # Log gradient norms for debugging
+            grad_norm = torch.norm(torch.stack([
+                torch.norm(p.grad.detach()) 
+                for p in parameters 
+                if p.grad is not None
+            ]))
+            logger.debug(f"Gradient norm after clipping: {grad_norm}")
 
 class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
     def __init__(self, args_dir, model, tokenizer, 
@@ -1132,3 +1172,73 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
 
     def print_trainer_type(self):
         print("I am an AcceleratedNLPSeq2SeqTrainer!")
+
+    def clip_gradients(self, parameters=None):
+        """
+        Apply PEFT-aware gradient clipping with seq2seq-specific adjustments.
+        
+        Args:
+            parameters: Optional list of parameters to clip. If None, uses all model parameters.
+        """
+        if not self.specs.get('max_grad_norm', 0) > 0:
+            return
+            
+        if parameters is None:
+            # For seq2seq, separate encoder and decoder parameters
+            encoder_params = []
+            decoder_params = []
+            shared_params = []
+            
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if 'encoder' in name:
+                    encoder_params.append(param)
+                elif 'decoder' in name:
+                    decoder_params.append(param)
+                else:
+                    shared_params.append(param)
+            
+            # Get PEFT-specific clipping configuration
+            if self.is_peft_model and hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # Different clipping for encoder/decoder in LoRA
+                    encoder_norm = self.specs['max_grad_norm'] * 0.7
+                    decoder_norm = self.specs['max_grad_norm'] * 0.9
+                    shared_norm = self.specs['max_grad_norm'] * 0.8
+                elif "PREFIX" in peft_type:
+                    # Different clipping for prefix tuning
+                    encoder_norm = self.specs['max_grad_norm'] * 1.1
+                    decoder_norm = self.specs['max_grad_norm'] * 1.3
+                    shared_norm = self.specs['max_grad_norm'] * 1.2
+                else:
+                    encoder_norm = decoder_norm = shared_norm = self.specs['max_grad_norm']
+            else:
+                encoder_norm = decoder_norm = shared_norm = self.specs['max_grad_norm']
+            
+            # Apply clipping to each parameter group using Accelerator
+            if encoder_params:
+                self.accelerator.clip_grad_norm_(encoder_params, encoder_norm)
+            if decoder_params:
+                self.accelerator.clip_grad_norm_(decoder_params, decoder_norm)
+            if shared_params:
+                self.accelerator.clip_grad_norm_(shared_params, shared_norm)
+                
+            if self.specs.get('debug_gradients', False):
+                # Log gradient norms for debugging
+                for name, params, norm in [
+                    ('encoder', encoder_params, encoder_norm),
+                    ('decoder', decoder_params, decoder_norm),
+                    ('shared', shared_params, shared_norm)
+                ]:
+                    if params:
+                        grad_norm = torch.norm(torch.stack([
+                            torch.norm(p.grad.detach()) 
+                            for p in params 
+                            if p.grad is not None
+                        ]))
+                        logger.debug(f"{name} gradient norm after clipping: {grad_norm} (max: {norm})")
+        else:
+            # If parameters are provided, use parent implementation
+            super().clip_gradients(parameters)
