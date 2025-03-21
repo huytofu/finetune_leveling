@@ -83,98 +83,66 @@ from .distillation import DistillationConfig, DistillationManager
 from .mlflow_tracking import MLflowTracker
 from .advanced_training import AdvancedTrainingConfig, AdvancedTrainingManager
 from .model_merging import ModelMergeConfig, ModelMerger
+from .monitoring import UnifiedMonitor, MetricConfig
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 class MLflowCallback:
-    """
-    Callback for tracking training metrics in MLflow.
+    """Callback for tracking training metrics in MLflow."""
     
-    This callback integrates with the Hugging Face Transformers trainer to track
-    metrics, parameters, and resource usage throughout the training process.
-    """
-    
-    def __init__(self, run_id: str):
+    def __init__(self, monitor: UnifiedMonitor):
         """
         Initialize the MLflow callback.
         
         Args:
-            run_id (str): The MLflow run ID to log metrics to
+            monitor: UnifiedMonitor instance for tracking
         """
-        self.run_id = run_id
-        self.epoch_start_time = None
-        self.step_start_time = None
+        self.monitor = monitor
+    
+    def on_init(self, args, state, control, **kwargs):
+        """Log initial training parameters."""
+        self.monitor.log_metrics({
+            "train_batch_size": args.per_device_train_batch_size,
+            "eval_batch_size": args.per_device_eval_batch_size,
+            "learning_rate": args.learning_rate,
+            "num_train_epochs": args.num_train_epochs,
+            "warmup_steps": args.warmup_steps,
+            "weight_decay": args.weight_decay,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "max_grad_norm": args.max_grad_norm
+        })
+    
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        """Log epoch start."""
+        self.monitor.log_metric(f"epoch_{state.epoch}", state.epoch)
+    
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """Log epoch metrics."""
+        epoch_duration = time.time() - state.epoch_start_time
+        self.monitor.log_metric(f"epoch_{state.epoch}_duration", epoch_duration)
         
-    def on_train_begin(self, args, state, control):
-        """
-        Called when training begins.
-        
-        Logs initial training parameters to MLflow.
-        
-        Args:
-            args: Training arguments
-            state: Training state
-            control: Training control
-        """
-        self.epoch_start_time = time.time()
-        mlflow.log_param("train_batch_size", args.per_device_train_batch_size)
-        mlflow.log_param("eval_batch_size", args.per_device_eval_batch_size)
-        mlflow.log_param("learning_rate", args.learning_rate)
-        mlflow.log_param("num_train_epochs", args.num_train_epochs)
-        mlflow.log_param("warmup_steps", args.warmup_steps)
-        mlflow.log_param("weight_decay", args.weight_decay)
-        mlflow.log_param("gradient_accumulation_steps", args.gradient_accumulation_steps)
-        mlflow.log_param("max_grad_norm", args.max_grad_norm)
-        
-    def on_epoch_begin(self, args, state, control):
-        """Called when an epoch begins."""
-        self.epoch_start_time = time.time()
-        mlflow.log_param(f"epoch_{state.epoch}", state.epoch)
-        
-    def on_epoch_end(self, args, state, control):
-        """Called when an epoch ends."""
-        epoch_duration = time.time() - self.epoch_start_time
-        mlflow.log_metric(f"epoch_{state.epoch}_duration", epoch_duration)
-        
-        # Log resource usage at epoch end
-        mlflow.log_metric(f"epoch_{state.epoch}_cpu_percent", psutil.cpu_percent())
-        mlflow.log_metric(f"epoch_{state.epoch}_memory_percent", psutil.virtual_memory().percent)
-        if torch.cuda.is_available():
-            mlflow.log_metric(f"epoch_{state.epoch}_gpu_percent", torch.cuda.utilization())
-            mlflow.log_metric(f"epoch_{state.epoch}_gpu_memory_percent", 
-                            torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() * 100)
-        
-    def on_step_begin(self, args, state, control):
-        """Called when a training step begins."""
-        self.step_start_time = time.time()
-        
-    def on_step_end(self, args, state, control):
-        """Called when a training step ends."""
-        if self.step_start_time:
-            step_duration = time.time() - self.step_start_time
-            mlflow.log_metric(f"step_{state.global_step}_duration", step_duration)
-            
-            # Log step metrics
-            if state.log_history:
-                for log in state.log_history:
-                    if isinstance(log, dict):
-                        for key, value in log.items():
-                            if isinstance(value, (int, float)):
-                                mlflow.log_metric(f"step_{state.global_step}_{key}", value)
-        
-    def on_evaluate(self, args, state, control, metrics=None):
-        """Called after evaluation."""
+        # Log hardware metrics
+        self.monitor.log_hardware_metrics(state.global_step)
+    
+    def on_step_begin(self, args, state, control, **kwargs):
+        """Log step start time."""
+        state.step_start_time = time.time()
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Log step metrics."""
+        step_duration = time.time() - state.step_start_time
+        self.monitor.log_metric(f"step_{state.global_step}_duration", step_duration)
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Log evaluation metrics."""
         if metrics:
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)):
-                    mlflow.log_metric(f"eval_{key}", value)
-                    
-    def on_save(self, args, state, control):
-        """Called when a checkpoint is saved."""
-        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-        if os.path.exists(checkpoint_path):
-            mlflow.log_artifact(checkpoint_path, f"checkpoint_{state.global_step}")
+            self.monitor.log_metrics({f"eval_{k}": v for k, v in metrics.items()})
+    
+    def on_save(self, args, state, control, **kwargs):
+        """Log model checkpoint."""
+        if state.best_model_checkpoint:
+            self.monitor.log_artifact(state.best_model_checkpoint, f"checkpoint_{state.global_step}")
 
 class InferencePipeLine():
     def __init__(self, task_type, checkpoint, adapter_config=None):
