@@ -25,7 +25,13 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
     Trainer,
-    TrainingArguments
+    TrainingArguments,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
+    AutoModelForSeq2SeqLM,
+    AutoModelForQuestionAnswering,
+    AutoModel
 )
 import time
 import mlflow
@@ -439,27 +445,184 @@ class InferencePipeLine():
         # Fallback to the first adapter if no match is found
         return self.adapter_manager.list_adapters()[0]['id']
 
+@dataclass
 class FineTuneConfig:
-    """Configuration for fine-tuning pipeline.
-    
-    Attributes:
-        task_type: Type of fine-tuning task
-        model_name: Name or path of the model
-        optimization: Training optimization configuration
-        distributed: Distributed training configuration
-        curriculum: Curriculum learning configuration
-        few_shot: Few-shot adaptation configuration
-        distillation: Knowledge distillation configuration
-        mlflow_tracking: Whether to track metrics with MLflow
-    """
-    task_type: str
+    """Configuration for fine-tuning pipeline."""
     model_name: str
-    optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
-    distributed: Optional[DistributedConfig] = None
-    curriculum: Optional[CurriculumConfig] = None
-    few_shot: Optional[FewShotConfig] = None
-    distillation: Optional[DistillationConfig] = None
-    mlflow_tracking: bool = True
+    task_type: str
+    
+    # Basic training parameters
+    batch_size: int = 32
+    learning_rate: float = 2e-5
+    num_epochs: int = 3
+    max_length: int = 512
+    
+    # Framework options
+    use_lightning: bool = False
+    use_accelerate: bool = False
+    
+    # Advanced optimization techniques
+    use_mixed_precision: bool = False
+    use_dynamic_batching: bool = False
+    use_curriculum_learning: bool = False
+    use_few_shot: bool = False
+    
+    # PEFT configuration
+    use_peft: bool = False
+    peft_method: str = "lora"  # Options: "lora", "prefix", "prompt", "adapter"
+    
+    # Distillation configuration
+    use_distillation: bool = False
+    teacher_model_name: Optional[str] = None
+    distillation_alpha: float = 0.5
+    temperature: float = 2.0
+    distill_logits: bool = True
+    distill_hidden_states: bool = False
+    teacher_layers_to_distill: Optional[List[int]] = None
+    
+    # LoRA specific settings
+    lora_r: int = 8  # rank of LoRA matrices
+    lora_alpha: int = 16  # scaling factor
+    lora_dropout: float = 0.1
+    lora_target_modules: Optional[List[str]] = None
+    
+    # Prefix-tuning settings
+    prefix_length: int = 30
+    prefix_projection: bool = False
+    
+    # Prompt-tuning settings
+    prompt_length: int = 100
+    prompt_initialization: str = "random"  # Options: "random", "text", "embedding"
+    
+    # Adapter settings
+    adapter_size: int = 64
+    adapter_dropout: float = 0.1
+    adapter_scaling: float = 1.0
+    
+    # Mixed precision settings
+    mixed_precision_dtype: str = "float16"
+    mixed_precision_loss_scale: str = "dynamic"
+    
+    # Dynamic batching settings
+    dynamic_batch_size_range: Tuple[int, int] = (16, 128)
+    dynamic_batch_growth_factor: float = 1.5
+    dynamic_batch_memory_threshold: float = 0.8
+    
+    # Curriculum learning settings
+    curriculum_difficulty_metric: str = "length"
+    curriculum_steps: List[float] = field(default_factory=lambda: [0.25, 0.5, 0.75, 1.0])
+    curriculum_scoring_function: str = "linear"
+    
+    # Few-shot settings
+    few_shot_examples: int = 5
+    few_shot_metric: str = "similarity"
+    few_shot_selection: str = "kmeans"
+    
+    # MLflow tracking
+    enable_mlflow: bool = True
+    mlflow_experiment_name: Optional[str] = None
+    
+    def get_peft_config(self) -> Dict[str, Any]:
+        """Get PEFT configuration based on selected method."""
+        if not self.use_peft:
+            return None
+            
+        if self.peft_method == "lora":
+            return {
+                "r": self.lora_r,
+                "lora_alpha": self.lora_alpha,
+                "lora_dropout": self.lora_dropout,
+                "target_modules": self.lora_target_modules,
+                "bias": "none",
+                "task_type": self.task_type
+            }
+        elif self.peft_method == "prefix":
+            return {
+                "num_virtual_tokens": self.prefix_length,
+                "projection": self.prefix_projection,
+                "task_type": self.task_type
+            }
+        elif self.peft_method == "prompt":
+            return {
+                "num_virtual_tokens": self.prompt_length,
+                "prompt_initialization": self.prompt_initialization,
+                "task_type": self.task_type
+            }
+        elif self.peft_method == "adapter":
+            return {
+                "adapter_size": self.adapter_size,
+                "adapter_dropout": self.adapter_dropout,
+                "adapter_scaling": self.adapter_scaling,
+                "task_type": self.task_type
+            }
+        else:
+            raise ValueError(f"Unsupported PEFT method: {self.peft_method}")
+
+    def _get_trainer_class(self):
+        """Get the appropriate trainer class based on task type and configuration."""
+        is_seq2seq = self.task_type in ["summarization", "translation"]
+        
+        if self.use_lightning and self.use_accelerate:
+            logger.info("Using Lightning with Accelerate integration")
+            return (
+                AcceleratedNLPSeq2SeqTrainerWithLightning
+                if is_seq2seq
+                else AcceleratedNLPTrainerWithLightning
+            )
+        elif self.use_lightning:
+            logger.info("Using Lightning trainer")
+            return (
+                NLPSeq2SeqTrainerWithLightning
+                if is_seq2seq
+                else NLPTrainerWithLightning
+            )
+        elif self.use_accelerate:
+            logger.info("Using Accelerate trainer")
+            return (
+                AcceleratedNLPSeq2SeqTrainer
+                if is_seq2seq
+                else AcceleratedNLPTrainer
+            )
+        else:
+            logger.info("Using standard trainer")
+            return NLPSeq2SeqTrainer if is_seq2seq else NLPTrainer
+            
+    def _validate_config(self):
+        """Validate configuration settings."""
+        # Validate framework settings
+        if self.use_lightning and not self._is_lightning_available():
+            logger.warning("PyTorch Lightning not available, falling back to standard training")
+            self.use_lightning = False
+            
+        if self.use_accelerate and not self._is_accelerate_available():
+            logger.warning("Accelerate not available, falling back to standard training")
+            self.use_accelerate = False
+            
+        # Validate distillation settings
+        if self.use_distillation and not self.teacher_model_name:
+            raise ValueError("Teacher model name must be provided when using distillation")
+            
+        # Validate PEFT settings
+        if self.use_peft and self.peft_method not in ["lora", "prefix", "prompt", "adapter"]:
+            raise ValueError(f"Unsupported PEFT method: {self.peft_method}")
+            
+    @staticmethod
+    def _is_lightning_available():
+        """Check if PyTorch Lightning is available."""
+        try:
+            import pytorch_lightning
+            return True
+        except ImportError:
+            return False
+            
+    @staticmethod
+    def _is_accelerate_available():
+        """Check if Accelerate is available."""
+        try:
+            import accelerate
+            return True
+        except ImportError:
+            return False
 
 class FineTunePipeline:
     """Advanced fine-tuning pipeline with optimizations."""
@@ -480,7 +643,7 @@ class FineTunePipeline:
             
             # Initialize MLflow tracking
             self.mlflow_tracker = None
-            if config.mlflow_tracking:
+            if config.enable_mlflow:
                 try:
                     self.mlflow_tracker = MLflowTracker("fine_tuning")
                 except Exception as e:
@@ -496,104 +659,116 @@ class FineTunePipeline:
             logger.error(f"Error initializing FineTunePipeline: {str(e)}")
             raise
 
-    def _validate_config(self):
-        """Validate the configuration settings."""
-        if not self.config.task_type:
-            raise ValueError("task_type must be specified in config")
-        if not self.config.model_name:
-            raise ValueError("model_name must be specified in config")
-            
-        # Validate task type
-        valid_task_types = [
-            "classification", "token-classification", "summarization",
-            "translation", "question-answering", "language-modeling"
-        ]
-        if self.config.task_type not in valid_task_types:
-            raise ValueError(f"Invalid task_type: {self.config.task_type}. Must be one of {valid_task_types}")
-            
-        # Validate optimization settings
-        if self.config.optimization:
-            if self.config.optimization.use_lightning and not self._is_lightning_available():
-                logger.warning("PyTorch Lightning not available, falling back to standard training")
-                self.config.optimization.use_lightning = False
-                
-            if self.config.optimization.use_accelerate and not self._is_accelerate_available():
-                logger.warning("Accelerate not available, falling back to standard training")
-                self.config.optimization.use_accelerate = False
-
     def _initialize_components(self):
         """Initialize all pipeline components with error handling."""
         try:
-            # Initialize optimization components
+            # Initialize tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
+            
+            # Initialize model
+            self.model = self._initialize_model(self.config)
+            
+            # Initialize data collator
+            self.data_collator = DataCollatorWithPadding(
+                tokenizer=self.tokenizer,
+                padding='longest'
+            )
+            
+            # Initialize metrics
+            self.metric = self._get_metrics_for_task(self.config.task_type)
+            
+            # Initialize training optimizer
             self.training_optimizer = TrainingOptimizer(
                 self.model,
-                self.config.optimization
+                self.config
             )
             
             # Initialize distributed training if configured
             self.distributed_trainer = None
-            if self.config.distributed and torch.cuda.device_count() > 1:
+            if self.config.use_dynamic_batching and torch.cuda.device_count() > 1:
                 try:
                     self.distributed_trainer = DistributedTrainer(
                         self.model,
-                        self.config.distributed,
-                        self.config.optimization
+                        self.config,
+                        self.config
                     )
                 except Exception as e:
                     logger.warning(f"Failed to initialize distributed training: {str(e)}")
-                    
+            
             # Initialize curriculum learning if configured
             self.curriculum_manager = None
-            if self.config.curriculum:
+            if self.config.use_curriculum_learning:
                 try:
                     self.curriculum_manager = CurriculumManager(
                         self.model,
                         self.tokenizer,
-                        self.config.curriculum
+                        self.config
                     )
                 except Exception as e:
                     logger.warning(f"Failed to initialize curriculum learning: {str(e)}")
-                    
+            
             # Initialize few-shot adaptation if configured
             self.few_shot_adapter = None
-            if self.config.few_shot:
+            if self.config.use_few_shot:
                 try:
                     self.few_shot_adapter = FewShotAdapter(
                         self.model,
                         self.tokenizer,
-                        self.config.few_shot
+                        self.config
                     )
                 except Exception as e:
                     logger.warning(f"Failed to initialize few-shot adaptation: {str(e)}")
-                    
+            
             # Initialize knowledge distillation if configured
             self.distillation_manager = None
-            if self.config.distillation:
+            if self.config.use_distillation:
                 try:
+                    # Load teacher model
+                    teacher_model = None
+                    if self.config.teacher_model_name:
+                        logger.info(f"Loading teacher model: {self.config.teacher_model_name}")
+                        if self.config.task_type == "text_classification":
+                            teacher_model = AutoModelForSequenceClassification.from_pretrained(
+                                self.config.teacher_model_name,
+                                num_labels=self.num_labels
+                            )
+                        elif self.config.task_type == "token-classification":
+                            teacher_model = AutoModelForTokenClassification.from_pretrained(
+                                self.config.teacher_model_name,
+                                num_labels=self.num_labels
+                            )
+                        elif self.config.task_type in ["summarization", "translation"]:
+                            teacher_model = AutoModelForSeq2SeqLM.from_pretrained(
+                                self.config.teacher_model_name
+                            )
+                        elif self.config.task_type == "question-answering":
+                            teacher_model = AutoModelForQuestionAnswering.from_pretrained(
+                                self.config.teacher_model_name
+                            )
+                        else:
+                            teacher_model = AutoModel.from_pretrained(
+                                self.config.teacher_model_name
+                            )
+                    
                     self.distillation_manager = DistillationManager(
                         self.model,
-                        None,
+                        teacher_model,
                         self.tokenizer,
-                        self.config.distillation
+                        self.config
                     )
                 except Exception as e:
                     logger.warning(f"Failed to initialize knowledge distillation: {str(e)}")
             
-            # Initialize checkpoint manager
-            try:
-                self.checkpoint_manager = CheckpointManager(
-                    base_path=os.path.join("checkpoints", self.config.task_type),
-                    model_name=self.config.model_name
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize checkpoint manager: {str(e)}")
-                raise
-            
-            # Initialize metrics
-            self._initialize_metrics()
+            # Initialize MLflow tracking
+            self.mlflow_tracker = None
+            if self.config.enable_mlflow:
+                try:
+                    self.mlflow_tracker = MLflowTracker("fine_tuning")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize MLflow tracking: {str(e)}")
             
         except Exception as e:
-            logger.error(f"Error initializing components: {str(e)}")
+            logger.error(f"Failed to initialize components: {str(e)}")
             raise
 
     def _initialize_metrics(self):
@@ -609,61 +784,12 @@ class FineTunePipeline:
         except Exception as e:
             logger.warning(f"Failed to initialize metrics: {str(e)}")
 
-    @staticmethod
-    def _is_lightning_available():
-        """Check if PyTorch Lightning is available."""
-        try:
-            import pytorch_lightning
-            return True
-        except ImportError:
-            return False
-
-    @staticmethod
-    def _is_accelerate_available():
-        """Check if Accelerate is available."""
-        try:
-            import accelerate
-            return True
-        except ImportError:
-            return False
-
-    def _get_trainer_class(self):
-        """Get the appropriate trainer class based on task type and configuration."""
-        is_seq2seq = self.config.task_type in ["summarization", "translation"]
-        use_lightning = getattr(self.config.optimization, "use_lightning", False)
-        use_accelerate = getattr(self.config.optimization, "use_accelerate", False)
-        
-        if use_lightning and use_accelerate:
-            logger.info("Using Lightning with Accelerate integration")
-            return (
-                AcceleratedNLPSeq2SeqTrainerWithLightning
-                if is_seq2seq
-                else AcceleratedNLPTrainerWithLightning
-            )
-        elif use_lightning:
-            logger.info("Using Lightning trainer")
-            return (
-                NLPSeq2SeqTrainerWithLightning
-                if is_seq2seq
-                else NLPTrainerWithLightning
-            )
-        elif use_accelerate:
-            logger.info("Using Accelerate trainer")
-            return (
-                AcceleratedNLPSeq2SeqTrainer
-                if is_seq2seq
-                else AcceleratedNLPTrainer
-            )
-        else:
-            logger.info("Using standard trainer")
-            return NLPSeq2SeqTrainer if is_seq2seq else NLPTrainer
-
     def _initialize_trainer(self, train_dataset, eval_dataset, **kwargs):
         """Initialize the appropriate trainer with all necessary components."""
         # Prepare training arguments
         training_args = TrainingArguments(
             output_dir=os.path.join("checkpoints", self.config.task_type),
-            **self.config.optimization.__dict__
+            **self.config.__dict__
         )
         
         # Get data collator based on task type
@@ -1005,7 +1131,7 @@ class FineTunePipeline:
             for start, end in zip(start_logits, end_logits):
                 start_idx = np.argmax(start)
                 end_idx = np.argmax(end[start_idx:]) + start_idx
-                
+
                 answer = {
                     "answer": self.tokenizer.decode(predictions[start_idx:end_idx+1]),
                     "start": int(start_idx),
@@ -1017,6 +1143,39 @@ class FineTunePipeline:
             return all_answers
             
         return predictions.tolist()
+
+    def _initialize_model(self, config: FineTuneConfig):
+        """Initialize model with PEFT if enabled."""
+        try:
+            # Load base model
+            model = AutoModelForSequenceClassification.from_pretrained(
+                config.model_name,
+                num_labels=self.num_labels
+            )
+            
+            # Apply PEFT if enabled
+            if config.use_peft:
+                from peft import get_peft_model, LoraConfig, PrefixTuningConfig, PromptTuningConfig, AdapterConfig
+                
+                peft_config = None
+                if config.peft_method == "lora":
+                    peft_config = LoraConfig(**config.get_peft_config())
+                elif config.peft_method == "prefix":
+                    peft_config = PrefixTuningConfig(**config.get_peft_config())
+                elif config.peft_method == "prompt":
+                    peft_config = PromptTuningConfig(**config.get_peft_config())
+                elif config.peft_method == "adapter":
+                    peft_config = AdapterConfig(**config.get_peft_config())
+                    
+                model = get_peft_model(model, peft_config)
+                model.print_trainable_parameters()
+                
+            return model
+            
+        except Exception as e:
+            logger.error(f"Error initializing model: {str(e)}")
+            ErrorHandler.handle_error(e, "model_initialization")
+            raise
 
 
 
