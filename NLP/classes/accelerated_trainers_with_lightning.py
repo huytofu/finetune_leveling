@@ -130,54 +130,35 @@ class AcceleratedNLPTrainer(pl.LightningModule):
             self.model.config.use_cache = False
 
     def configure_optimizers(self):
-        """Configure optimizers with PEFT awareness"""
-        if self.optimizer_init is not None and self.scheduler_init is not None:
-            # Prepare optimizer and scheduler with Accelerator
-            optimizer = self.accelerator.prepare_optimizer(self.optimizer_init)
-            scheduler = self.accelerator.prepare_scheduler(self.scheduler_init)
+        """Configure and return the optimizer with proper parameter handling."""
+        # Get trainable parameters based on PEFT status
+        if self.is_peft_model:
+            params = [p for p in self.parameters() if p.requires_grad]
+            logger.info(f"Configuring optimizer for PEFT model with {len(params)} trainable parameters")
+        else:
+            params = self.parameters()
+            logger.info("Configuring optimizer for full model")
+
+        # Create optimizer with specified or default parameters
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=self.specs.get('learning_rate', 2e-5),
+            weight_decay=self.specs.get('weight_decay', 0.01),
+        )
+        
+        # Configure scheduler if specified
+        if self.specs.get('use_lr_scheduler', False):
+            scheduler = self.get_scheduler(optimizer)
             return {
-                'optimizer': optimizer,
-                'lr_scheduler': {
-                    'scheduler': scheduler,
-                    'interval': 'step',
-                    'frequency': 1
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1
                 }
             }
-
-        # Get trainable parameters
-        if self.is_peft_model:
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            Logger.info(f"Configuring optimizer for PEFT model with {len(trainable_params)} trainable parameters")
-        else:
-            trainable_params = self.model.parameters()
-            
-        # Create and prepare optimizer with Accelerator
-        optimizer = self.accelerator.prepare_optimizer(
-            torch.optim.AdamW(
-                trainable_params,
-                lr=self.specs['learning_rate'],
-                weight_decay=self.specs.get('weight_decay', 0.01)
-            )
-        )
         
-        # Create and prepare scheduler with Accelerator
-        scheduler = self.accelerator.prepare_scheduler(
-            torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=self.specs['learning_rate'],
-                total_steps=self.trainer.estimated_stepping_batches,
-                pct_start=0.1
-            )
-        )
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'step',
-                'frequency': 1
-            }
-        }
+        return optimizer
 
     def _handle_gradients(self, loss):
         """Handle gradients with PEFT-specific optimizations and Lightning integration"""
@@ -629,12 +610,14 @@ class AcceleratedNLPTrainer(pl.LightningModule):
 
 
 class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setup_generation_config()
-        
-        if self.is_peft_model:
-            self._setup_seq2seq_peft_config()
+    def __init__(self, args_dir, model, tokenizer, 
+                data_collator, train_dataset, eval_dataset, 
+                task_type, optimizer=None, compute_metrics=None,
+                model_init=None, callbacks=None, scheduler=None, **kwargs):
+        super().__init__(args_dir, model, tokenizer, 
+                        data_collator, train_dataset, eval_dataset,
+                        task_type, optimizer, compute_metrics,
+                        model_init, callbacks, scheduler, **kwargs)
 
     def setup_generation_config(self):
         """Set up generation configuration with PEFT awareness"""

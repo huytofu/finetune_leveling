@@ -117,7 +117,7 @@ class AcceleratedNLPTrainer():
     """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, raw_dataset,
-                task_type, optimizer, chosen_metric):
+                task_type, optimizer=None, chosen_metric=None):
         """
         Initialize the AcceleratedNLPTrainer.
         
@@ -145,7 +145,7 @@ class AcceleratedNLPTrainer():
             self.is_peft_model = self._check_is_peft_model(model)
             self.peft_config = self._get_peft_config() if self.is_peft_model else None
             
-            self.optimizer = self._setup_optimizer(optimizer)
+            self.optimizer = self.configure_optimizers()
             
             self.prepare_with_accelerator(train_dataset, eval_dataset)
             self.prepare_scheduler()
@@ -234,35 +234,33 @@ class AcceleratedNLPTrainer():
         )
         return peft_config
 
-    def _setup_optimizer(self, optimizer):
-        """
-        Setup optimizer with PEFT-specific configurations.
-        
-        Args:
-            optimizer: An existing optimizer, or None to create a new one
-            
-        Returns:
-            The configured optimizer
-        """
-        if optimizer is not None:
-            return optimizer
-            
+    def configure_optimizers(self):
+        """Configure and return the optimizer with proper parameter handling."""
+        # Get trainable parameters based on PEFT status
         if self.is_peft_model:
-            # Only optimize trainable parameters for PEFT
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.specs.get('learning_rate', 2e-5),
-                weight_decay=self.specs.get('weight_decay', 0.01),
-            )
-            logger.info(f"Created PEFT-aware optimizer with {len(trainable_params)} trainable parameters")
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            logger.info(f"Configuring optimizer for PEFT model with {len(params)} trainable parameters")
         else:
-            optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=self.specs.get('learning_rate', 2e-5),
-                weight_decay=self.specs.get('weight_decay', 0.01),
-            )
-        return optimizer
+            params = self.model.parameters()
+            logger.info("Configuring optimizer for full model")
+
+        # Create optimizer with specified or default parameters
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=self.specs.get('learning_rate', 2e-5),
+            weight_decay=self.specs.get('weight_decay', 0.01),
+        )
+        
+        # Prepare optimizer with Accelerator if available
+        if hasattr(self, 'accelerator'):
+            optimizer = self.accelerator.prepare_optimizer(optimizer)
+        
+        # Configure scheduler if specified
+        if self.specs.get('use_lr_scheduler', False):
+            scheduler = self.prepare_scheduler(optimizer)
+            return optimizer, scheduler
+        
+        return optimizer, None
 
     def prepare_with_accelerator(self, train_dataset, eval_dataset):
         """Prepare with Accelerator, including PEFT and mixed precision support"""
@@ -349,26 +347,61 @@ class AcceleratedNLPTrainer():
             return False, self.specs['per_device_eval_batch_size']
     
     def prepare_scheduler(self):
-        #Prepare scheduler specs
-        self.scheduler_strategy = self.specs['scheduler_strategy']
-        self.num_train_epochs = self.specs['num_train_epochs']
-        self.num_warmup_steps = self.specs.get('num_warmup_steps', 0)
+        """Prepare learning rate scheduler with proper configuration."""
+        num_training_steps = self.calculate_training_steps()
         
-        self.calculate_training_steps()
+        # Get scheduler type and warmup ratio from specs
+        scheduler_type = self.specs.get('scheduler_type', 'linear')
+        warmup_ratio = self.specs.get('warmup_ratio', 0.1)
+        num_warmup_steps = int(num_training_steps * warmup_ratio)
+        
+        if scheduler_type == 'linear':
+            from transformers import get_linear_schedule_with_warmup
+            scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps
+            )
+        elif scheduler_type == 'cosine':
+            from transformers import get_cosine_schedule_with_warmup
+            scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps
+            )
+        elif scheduler_type == 'one_cycle':
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=self.specs.get('learning_rate', 2e-5),
+                total_steps=num_training_steps,
+                pct_start=warmup_ratio
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+            
+        # Prepare scheduler with Accelerator if available
+        if hasattr(self, 'accelerator'):
+            scheduler = self.accelerator.prepare_scheduler(scheduler)
+            
+        logger.info(f"Created {scheduler_type} scheduler with {num_warmup_steps} warmup steps")
+        return scheduler
 
-        self.lr_scheduler = get_scheduler(
-            self.scheduler_strategy,
-            optimizer=self.optimizer,
-            num_warmup_steps=self.num_warmup_steps,
-            num_training_steps=self.num_training_steps,
-        )
-    
     def calculate_training_steps(self):
-        """
-        Calculate the number of training steps.
-        """
-        num_update_steps_per_epoch = len(self.train_dataloader)
-        self.num_training_steps = self.num_train_epochs * num_update_steps_per_epoch
+        """Calculate total training steps."""
+        train_dataset_size = len(self.datasets['train'])
+        batch_size = self.specs.get('per_device_train_batch_size', 8)
+        grad_accumulation = self.specs.get('gradient_accumulation_steps', 1)
+        num_epochs = self.specs.get('num_train_epochs', 3)
+        
+        # Account for distributed training with Accelerator
+        if hasattr(self, 'accelerator'):
+            num_processes = self.accelerator.num_processes
+            batch_size *= num_processes
+            
+        steps_per_epoch = train_dataset_size // (batch_size * grad_accumulation)
+        total_steps = steps_per_epoch * num_epochs
+        
+        return total_steps
 
     def save_and_upload(self, epoch):
         # Split into save and upload methods
@@ -602,16 +635,16 @@ class AcceleratedNLPTrainer():
                 # More conservative updates for prefix parameters
                 param.grad.data = param.grad.data * 0.8
 
-    def _train_step(self, batch, step):
+    def training_step(self, batch, step):
         """
-        Execute a single training step with optimizations.
+        Execute a single training step with optimizations and loss handling.
         
         Args:
             batch: The current batch of data
             step: The current training step
             
         Returns:
-            dict: Training metrics for this step
+            dict: Training metrics for this step including loss
         """
         try:
             self.model.train()
@@ -625,14 +658,19 @@ class AcceleratedNLPTrainer():
                 outputs = self.model(**batch)
                 loss = outputs.loss
                 
-            # Handle gradients with PEFT-specific optimizations
-            if self.is_peft_model:
-                loss = self._handle_gradients(loss, step)
-                self._scale_gradients()
+            # Handle loss scaling based on PEFT type
+            if self.is_peft_model and hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # Scale based on LoRA alpha
+                    loss = loss / getattr(self.model.peft_config, "lora_alpha", 32)
+                elif "PREFIX" in peft_type:
+                    # Prefix tuning might need different scaling
+                    loss = loss * 1.2
                 
-            # Gradient accumulation if configured
+            # Handle gradient accumulation
             if self.specs.get('gradient_accumulation_steps', 1) > 1:
-                loss = loss / self.specs['gradient_accumulation_steps']
+                loss = loss / self.specs.get('gradient_accumulation_steps')
                 
             # Backward pass with gradient scaling
             self.accelerator.backward(loss)
@@ -643,6 +681,9 @@ class AcceleratedNLPTrainer():
                     self.model.parameters(),
                     self.specs['max_grad_norm']
                 )
+                
+            # Scale gradients based on PEFT type
+            self._scale_gradients()
                 
             # Update weights if gradient accumulation complete
             if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
@@ -665,7 +706,7 @@ class AcceleratedNLPTrainer():
             return metrics
             
         except Exception as e:
-            ErrorHandler.handle_error(e, "_train_step")
+            ErrorHandler.handle_error(e, "training_step")
             raise
 
     def train(self):
@@ -688,7 +729,7 @@ class AcceleratedNLPTrainer():
             # Main training loop
             for step, batch in enumerate(self.train_dataloader):
                 # Training step with optimizations
-                metrics = self._train_step(batch, step)
+                metrics = self.training_step(batch, step)
                 total_loss += metrics['loss']
                 
                 # Evaluation if needed
@@ -800,8 +841,12 @@ class AcceleratedNLPTrainer():
 
 
 class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, args_dir, model, tokenizer, 
+                data_collator, train_dataset, eval_dataset, raw_dataset,
+                task_type, optimizer=None, chosen_metric=None):
+        super().__init__(args_dir, model, tokenizer, 
+                        data_collator, train_dataset, eval_dataset, raw_dataset,
+                        task_type, optimizer, chosen_metric)
         self.setup_seq2seq_config()
         
     def setup_seq2seq_config(self):
@@ -937,8 +982,17 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             for param in decoder_params:
                 param.grad.data = param.grad.data * 1.1
 
-    def _train_step(self, step, batch):
-        """Enhanced training step with specialized seq2seq handling"""
+    def training_step(self, batch, step):
+        """
+        Enhanced training step with specialized seq2seq handling and loss computation.
+        
+        Args:
+            batch: The current batch of data
+            step: The current training step
+            
+        Returns:
+            dict: Training metrics for this step including loss
+        """
         try:
             # Setup gradient checkpointing
             self._setup_gradient_checkpointing()
@@ -961,12 +1015,19 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             
             loss = outputs.loss
             
-            # Handle gradients
-            loss = self._handle_seq2seq_gradients(loss)
+            # Handle loss scaling based on PEFT type
+            if self.is_peft_model and hasattr(self.model, "peft_config"):
+                peft_type = self.model.peft_config.peft_type
+                if peft_type == "LORA":
+                    # Different scaling for Seq2Seq LoRA
+                    loss = loss / (getattr(self.model.peft_config, "lora_alpha", 32) * 1.2)
+                elif "PREFIX" in peft_type:
+                    # Different scaling for Seq2Seq prefix tuning
+                    loss = loss * 1.1
             
-            # Scale loss for gradient accumulation
+            # Handle gradient accumulation
             if self.specs.get('gradient_accumulation_steps', 1) > 1:
-                loss = loss / self.specs['gradient_accumulation_steps']
+                loss = loss / self.specs.get('gradient_accumulation_steps')
             
             # Backward pass
             self.accelerator.backward(loss)
@@ -974,42 +1035,35 @@ class AcceleratedNLPSeq2SeqTrainer(AcceleratedNLPTrainer):
             # Scale gradients
             self._scale_seq2seq_gradients()
             
-            # Log metrics
+            # Update weights if gradient accumulation complete
+            if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+            
+            # Compute metrics
+            metrics = {
+                'loss': loss.item(),
+                'learning_rate': self.lr_scheduler.get_last_lr()[0],
+                'step': step,
+                'epoch': step / self.num_training_steps
+            }
+            
+            # Log gradient norm if in debug mode
             if self.specs.get('debug_gradients', False):
                 trainable_params = [p for p in self.model.parameters() if p.requires_grad]
                 grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params if p.grad is not None]))
-                self.log({'gradient_norm': grad_norm})
+                metrics['gradient_norm'] = grad_norm.item()
             
-            return loss.item()
+            # Update progress bar
+            self.progress_bar.update(1)
+            self.progress_bar.set_postfix(**metrics)
+            
+            return metrics
             
         except Exception as e:
             logger.error(f"Error in Seq2Seq training step {step}: {e}")
             raise e
-
-    def _eval_step(self, batch):
-        """Enhanced evaluation step with memory optimizations"""
-        inputs = self._prepare_inputs(batch)
-        
-        generation_kwargs = self._optimize_beam_search()
-        
-        # Generate with optimized memory usage
-        with torch.no_grad():
-            with self.accelerator.autocast():
-                generated_tokens = self.model.generate(
-                    inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    **generation_kwargs,
-                )
-                
-                # Compute loss
-                outputs = self.model(**inputs)
-                loss = outputs.loss
-        
-        return {
-            'loss': loss.item(),
-            'generated': generated_tokens,
-            'labels': inputs.get('labels')
-        }
 
     def save_model(self, output_dir: str = None):
         """Enhanced model saving with seq2seq state management"""

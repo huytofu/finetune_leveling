@@ -51,17 +51,9 @@ class NLPTrainer(Trainer):
         # Check if this is a PEFT model before initializing
         self.is_peft_model = self._check_is_peft_model(model)
         
-        # Setup optimizers with PEFT awareness
-        if optimizer is None and self.is_peft_model:
-            # Only optimize trainable parameters for PEFT models
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.specs.get('learning_rate', 2e-5),
-                weight_decay=self.specs.get('weight_decay', 0.01),
-            )
-            logger.info(f"Created optimizer for PEFT model with {len(trainable_params)} trainable parameters")
-
+        # Move optimizer initialization to configure_optimizers
+        self.optimizer = self.configure_optimizers()
+        
         # Initialize metrics based on task type
         self.metric = None
         if task_type in ["classification", "token-classification"]:
@@ -82,7 +74,7 @@ class NLPTrainer(Trainer):
                         train_dataset=train_dataset, 
                         eval_dataset=eval_dataset,
                         tokenizer=tokenizer, 
-                        optimizers=[optimizer, scheduler] if optimizer else None,
+                        optimizers=[self.optimizer, scheduler] if self.optimizer else None,
                         model_init=model_init, 
                         compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
@@ -101,6 +93,78 @@ class NLPTrainer(Trainer):
         except ImportError:
             logger.info("PEFT not installed, continuing with standard training")
             return False
+
+    def prepare_scheduler(self, optimizer):
+        """Prepare learning rate scheduler with proper configuration."""
+        num_training_steps = self.calculate_training_steps()
+        
+        # Get scheduler type and warmup ratio from specs
+        scheduler_type = self.specs.get('scheduler_type', 'linear')
+        warmup_ratio = self.specs.get('warmup_ratio', 0.1)
+        num_warmup_steps = int(num_training_steps * warmup_ratio)
+        
+        if scheduler_type == 'linear':
+            from transformers import get_linear_schedule_with_warmup
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps
+            )
+        elif scheduler_type == 'cosine':
+            from transformers import get_cosine_schedule_with_warmup
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+            
+        logger.info(f"Created {scheduler_type} scheduler with {num_warmup_steps} warmup steps")
+        return scheduler
+
+    def calculate_training_steps(self):
+        """Calculate total training steps."""
+        train_dataset_size = len(self.train_dataset)
+        batch_size = self.specs.get('per_device_train_batch_size', 8)
+        grad_accumulation = self.specs.get('gradient_accumulation_steps', 1)
+        num_epochs = self.specs.get('num_train_epochs', 3)
+        
+        steps_per_epoch = train_dataset_size // (batch_size * grad_accumulation)
+        total_steps = steps_per_epoch * num_epochs
+        
+        return total_steps
+
+    def configure_optimizers(self):
+        """Configure and return the optimizer with proper parameter handling."""
+        # Get trainable parameters based on PEFT status
+        if self.is_peft_model:
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            logger.info(f"Configuring optimizer for PEFT model with {len(params)} trainable parameters")
+        else:
+            params = self.model.parameters()
+            logger.info("Configuring optimizer for full model")
+
+        # Create optimizer with specified or default parameters
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=self.specs.get('learning_rate', 2e-5),
+            weight_decay=self.specs.get('weight_decay', 0.01),
+        )
+        
+        # Configure scheduler if specified
+        if self.specs.get('use_lr_scheduler', False):
+            scheduler = self.prepare_scheduler(optimizer)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1
+                }
+            }
+        
+        return optimizer
 
     def train(self):
         """Train the model, with special handling for PEFT models"""
@@ -389,17 +453,9 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
         # Check if this is a PEFT model before initializing
         self.is_peft_model = self._check_is_peft_model(model)
         
-        # Setup optimizers with PEFT awareness
-        if optimizer is None and self.is_peft_model:
-            # Only optimize trainable parameters for PEFT models
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.specs.get('learning_rate', 2e-5),
-                weight_decay=self.specs.get('weight_decay', 0.01),
-            )
-            logger.info(f"Created optimizer for PEFT model with {len(trainable_params)} trainable parameters")
-
+        # Move optimizer initialization to configure_optimizers
+        self.optimizer = self.configure_optimizers()
+        
         # Initialize metrics based on task type
         self.metric = None
         if task_type in ["summarization", "translation"]:
@@ -426,7 +482,7 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
                         train_dataset=train_dataset, 
                         eval_dataset=eval_dataset,
                         tokenizer=tokenizer, 
-                        optimizers=[optimizer, scheduler] if optimizer else None,
+                        optimizers=[self.optimizer, scheduler] if self.optimizer else None,
                         model_init=model_init, 
                         compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
@@ -445,6 +501,25 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
         except ImportError:
             logger.info("PEFT not installed, continuing with standard training")
             return False
+
+    def configure_optimizers(self):
+        """Configure and return the optimizer with proper parameter handling."""
+        # Get trainable parameters based on PEFT status
+        if self.is_peft_model:
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            logger.info(f"Configuring optimizer for PEFT model with {len(params)} trainable parameters")
+        else:
+            params = self.model.parameters()
+            logger.info("Configuring optimizer for full model")
+
+        # Create optimizer with specified or default parameters
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=self.specs.get('learning_rate', 2e-5),
+            weight_decay=self.specs.get('weight_decay', 0.01),
+        )
+        
+        return optimizer
 
     def train(self):
         """Train the model, with special handling for PEFT models"""
