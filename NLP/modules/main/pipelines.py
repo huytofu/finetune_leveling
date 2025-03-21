@@ -1,27 +1,26 @@
 """Pipeline implementations for model training and inference."""
 
-import logging
 import os
 import sys
-from typing import Dict, Any, Optional, List, Union
 import json
+import logging
+from typing import Dict, Any, Optional, List, Union
 from transformers import (
     pipeline,
     PreTrainedModel,
     PreTrainedTokenizer
 )
 
-# Local imports
-currdir = os.path.dirname(os.path.abspath(__file__))
-parentdir = os.path.dirname(currdir)
+# Add to Python path
+currdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(currdir)
-sys.path.append(parentdir)
 
-from adapter_manager import MultiAdapterManager
+# Local imports
 from configs.default_config import DEFAULT_SPECS
-from .config.training_config import FineTuneConfig
-from .config.mlflow_config import MLflowConfig
-from .pipeline_modules import PipelineOrchestrator
+from modules.managers.adapter_manager import MultiAdapterManager
+from modules.config.training_config import FineTuneConfig
+from modules.config.mlflow_config import MLflowConfig
+from modules.orchestration.pipeline_modules import PipelineOrchestrator
 
 logger = logging.getLogger(__name__)
 

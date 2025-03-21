@@ -1,9 +1,19 @@
 import os
+import sys
 import json
 import torch
 import logging
 from typing import Dict, Any, Optional, Union, List, Tuple
 from transformers import PreTrainedModel, PreTrainedTokenizer
+
+# Add to Python path
+parentdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parentdir)
+
+# Local imports
+from modules.managers.config_manager import ConfigManager
+from modules.monitoring_and_tracking.mlflow_tracking import MLflowTracker
+from modules.customizations_and_optimizations.training_optimizations import TrainingOptimizer
 
 logger = logging.getLogger(__name__)
 

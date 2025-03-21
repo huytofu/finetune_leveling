@@ -1,21 +1,20 @@
 import os
 import sys
-parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(parentdir)
-
 import json
 import logging
-import torch
 from typing import Optional, Dict, Any, Union, List
-import evaluate
 from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationConfig
+
+# Add to Python path
+parentdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parentdir)
+
+# Local imports
 from configs.default_config import DEFAULT_SPECS
-import random
-import numpy as np
-import nltk
-from mlflow_callback import MLflowCallback
-from ..modules.trainer_customization import TrainerCustomizationMixin
-from .trainer_utils import (
+from modules.monitoring_and_tracking.mlflow_tracking import MLflowCallback
+from modules.customizations_and_optimizations.trainer_customization import TrainerCustomizationMixin
+from modules.customizations_and_optimizations.trainer_utils import (
+    PeftConfig,
     check_is_peft_model,
     prepare_scheduler,
     calculate_training_steps,

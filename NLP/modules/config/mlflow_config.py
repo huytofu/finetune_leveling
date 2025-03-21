@@ -1,11 +1,19 @@
 """MLFlow configuration and tracking functionality."""
 
+import os
+import sys
 import logging
 import time
 from typing import Dict, Any, Optional
 import mlflow
 from dataclasses import dataclass, field
-from ..monitoring import UnifiedMonitor, MetricConfig
+
+# Add to Python path
+parentdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parentdir)
+
+# Local imports
+from modules.monitoring import UnifiedMonitor, MetricConfig
 
 logger = logging.getLogger(__name__)
 

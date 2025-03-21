@@ -1,7 +1,19 @@
 """Configuration classes for training pipelines."""
 
+import os
+import sys
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple, Union
+
+# Add to Python path
+parentdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parentdir)
+
+# Local imports
+from modules.advanced_training import UnslothIntegration, validate_advanced_config
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class FineTuneConfig:
@@ -185,14 +197,12 @@ class FineTuneConfig:
         # Validate Unsloth compatibility
         if self.use_unsloth:
             # Check if model is supported by Unsloth
-            from ..advanced_training import UnslothIntegration
             if not UnslothIntegration.is_model_supported(self.model_name):
                 logger.warning(f"Model {self.model_name} is not supported by Unsloth. Disabling Unsloth.")
                 self.use_unsloth = False
         
         # Ensure advanced training config is validated
         if self.use_advanced_training:
-            from ..advanced_training import validate_advanced_config
             validate_advanced_config(self)
 
     @staticmethod

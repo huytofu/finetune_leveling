@@ -1,6 +1,14 @@
+import os
+import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from ..modules.training_optimizations import OptimizationConfig, HardwareAwareOptimizer
+
+# Add to Python path
+parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parentdir)
+
+# Local imports
+from modules.training_optimizations import OptimizationConfig, HardwareAwareOptimizer
 
 def main():
     # Initialize model and tokenizer

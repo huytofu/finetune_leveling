@@ -1,20 +1,24 @@
 import os
 import sys
-parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(parentdir)
-
 import json
+import logging
+import random
 import evaluate
 import pytorch_lightning as pl
 import torch
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
-from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationConfig
-from configs.default_config import DEFAULT_SPECS
 from torch.utils.data import DataLoader
-import random
-from ..modules.trainer_customization import TrainerCustomizationMixin
-from .trainer_utils import (
+from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationConfig
+
+# Add to Python path
+parentdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(parentdir)
+
+# Local imports
+from configs.default_config import DEFAULT_SPECS
+from modules.customizations_and_optimizations.trainer_customization import TrainerCustomizationMixin
+from modules.customizations_and_optimizations.trainer_utils import (
     PeftConfig,
     check_is_peft_model,
     prepare_scheduler,
@@ -26,7 +30,6 @@ from .trainer_utils import (
     optimize_memory_settings,
     setup_accelerate_integration
 )
-import logging
 
 logger = logging.getLogger(__name__)
 
