@@ -11,6 +11,9 @@ import evaluate
 from transformers import TrainingArguments, Trainer, Seq2SeqTrainer, GenerationConfig
 from configs.default_config import DEFAULT_SPECS
 import random
+import numpy as np
+import nltk
+from mlflow_callback import MLflowCallback
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,21 @@ class NLPTrainer(Trainer):
             )
             logger.info(f"Created optimizer for PEFT model with {len(trainable_params)} trainable parameters")
 
+        # Initialize metrics based on task type
+        self.metric = None
+        if task_type in ["classification", "token-classification"]:
+            self.metric = evaluate.load("accuracy")
+        elif task_type in ["summarization", "translation"]:
+            self.metric = evaluate.load("rouge")
+        elif task_type == "question-answering":
+            self.metric = evaluate.load("squad")
+            
+        # Initialize checkpoint manager
+        self.checkpoint_manager = CheckpointManager(
+            base_path=os.path.join("checkpoints", task_type),
+            model_name=model.config.name_or_path
+        )
+        
         super().__init__(model, self.args, 
                         data_collator=data_collator, 
                         train_dataset=train_dataset, 
@@ -66,7 +84,7 @@ class NLPTrainer(Trainer):
                         tokenizer=tokenizer, 
                         optimizers=[optimizer, scheduler] if optimizer else None,
                         model_init=model_init, 
-                        compute_metrics=compute_metrics,
+                        compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
 
     def _check_is_peft_model(self, model):
@@ -216,6 +234,120 @@ class NLPTrainer(Trainer):
         
         return outputs
 
+    def compute_metrics(self, eval_pred):
+        """Compute task-specific evaluation metrics."""
+        predictions, labels = eval_pred
+        if self.task_type in ["classification", "token-classification"]:
+            predictions = np.argmax(predictions, axis=-1)
+            return self.metric.compute(predictions=predictions, references=labels)
+            
+        elif self.task_type in ["summarization", "translation"]:
+            decoded_preds = self.tokenizer.batch_decode(
+                predictions, skip_special_tokens=True
+            )
+            decoded_labels = self.tokenizer.batch_decode(
+                labels, skip_special_tokens=True
+            )
+            
+            # Rouge expects a newline after each sentence
+            decoded_preds = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
+            decoded_labels = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
+            
+            result = self.metric.compute(
+                predictions=decoded_preds,
+                references=decoded_labels,
+                use_stemmer=True
+            )
+            
+            # Extract median scores
+            result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+            return result
+            
+        elif self.task_type == "question-answering":
+            decoded_preds = self.tokenizer.batch_decode(
+                predictions, skip_special_tokens=True
+            )
+            decoded_labels = self.tokenizer.batch_decode(
+                labels, skip_special_tokens=True
+            )
+            
+            formatted_predictions = [{"id": str(i), "prediction_text": pred} for i, pred in enumerate(decoded_preds)]
+            formatted_references = [{"id": str(i), "answers": {"text": [label], "answer_start": [0]}} for i, label in enumerate(decoded_labels)]
+            
+            result = self.metric.compute(
+                predictions=formatted_predictions,
+                references=formatted_references
+            )
+            return result
+            
+        return {}
+
+    def post_process_predictions(self, predictions):
+        """Post-process model predictions based on task type."""
+        if self.task_type in ["classification", "token-classification"]:
+            return np.argmax(predictions, axis=-1).tolist()
+            
+        elif self.task_type in ["summarization", "translation", "text-generation"]:
+            return self.tokenizer.batch_decode(
+                predictions,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            
+        elif self.task_type == "question-answering":
+            start_logits, end_logits = predictions
+            
+            all_answers = []
+            for start, end in zip(start_logits, end_logits):
+                start_idx = np.argmax(start)
+                end_idx = np.argmax(end[start_idx:]) + start_idx
+                
+                answer = {
+                    "answer": self.tokenizer.decode(predictions[start_idx:end_idx+1]),
+                    "start": int(start_idx),
+                    "end": int(end_idx),
+                    "score": float(start[start_idx] * end[end_idx])
+                }
+                all_answers.append(answer)
+                
+            return all_answers
+            
+        return predictions.tolist()
+
+    def save_checkpoint(
+        self,
+        step: int,
+        epoch: int,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        metrics: Optional[Dict[str, float]] = None
+    ):
+        """Save training checkpoint with metadata."""
+        checkpoint_path = self.checkpoint_manager.save_checkpoint(
+            model=self.model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=step,
+            epoch=epoch,
+            metrics=metrics
+        )
+        
+        # Log checkpoint as MLflow artifact if callback exists
+        mlflow_callback = next((cb for cb in self.callback_handler.callbacks if isinstance(cb, MLflowCallback)), None)
+        if mlflow_callback:
+            mlflow_callback.on_save(self.args, self.state, None)
+            
+        return checkpoint_path
+        
+    def load_checkpoint(
+        self,
+        checkpoint_path: str
+    ) -> Dict[str, Any]:
+        """Load checkpoint and return state dict."""
+        return self.checkpoint_manager.load_checkpoint(
+            model=self.model,
+            checkpoint_path=checkpoint_path
+        )
 
 class NLPSeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(self, args_dir, model, tokenizer, 
@@ -268,6 +400,27 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
             )
             logger.info(f"Created optimizer for PEFT model with {len(trainable_params)} trainable parameters")
 
+        # Initialize metrics based on task type
+        self.metric = None
+        if task_type in ["summarization", "translation"]:
+            self.metric = evaluate.load("rouge")
+        elif task_type == "question-answering":
+            self.metric = evaluate.load("squad")
+            
+        # Initialize checkpoint manager
+        self.checkpoint_manager = CheckpointManager(
+            base_path=os.path.join("checkpoints", task_type),
+            model_name=model.config.name_or_path
+        )
+        
+        # Set up generation config
+        self.generation_config = generation_config or GenerationConfig(
+            max_length=self.specs.get("max_length", 128),
+            num_beams=self.specs.get("num_beams", 4),
+            length_penalty=self.specs.get("length_penalty", 1.0),
+            early_stopping=self.specs.get("early_stopping", True)
+        )
+        
         super().__init__(model, self.args, 
                         data_collator=data_collator, 
                         train_dataset=train_dataset, 
@@ -275,122 +428,23 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
                         tokenizer=tokenizer, 
                         optimizers=[optimizer, scheduler] if optimizer else None,
                         model_init=model_init, 
-                        compute_metrics=compute_metrics,
+                        compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
 
-        self.setup_seq2seq_config()
-
-    def setup_seq2seq_config(self):
-        """Setup specialized configuration for seq2seq training"""
-        self.teacher_forcing_ratio = self.args.teacher_forcing_ratio if hasattr(self.args, 'teacher_forcing_ratio') else 0.5
-        self.use_selective_activation_cache = self.args.use_selective_activation_cache if hasattr(self.args, 'use_selective_activation_cache') else True
-        
-        # Setup generation config with memory optimization
-        self.generation_config = GenerationConfig(
-            max_length=self.args.max_length,
-            num_beams=self.args.num_beams if hasattr(self.args, 'num_beams') else 4,
-            length_penalty=self.args.length_penalty if hasattr(self.args, 'length_penalty') else 1.0,
-            early_stopping=True,
-            use_cache=not self.is_peft_model,  # Disable KV cache for PEFT models to save memory
-        )
-
-    def _prepare_inputs(self, inputs):
-        """Enhanced input preparation with specialized attention patterns"""
-        prepared_inputs = super()._prepare_inputs(inputs)
-        
-        # Handle attention masks differently for encoder and decoder
-        if 'attention_mask' in prepared_inputs:
-            encoder_attention_mask = prepared_inputs['attention_mask']
-            # Create causal mask for decoder
-            decoder_attention_mask = self._create_causal_mask(
-                prepared_inputs.get('decoder_input_ids', None)
-            )
-            
-            prepared_inputs['encoder_attention_mask'] = encoder_attention_mask
-            prepared_inputs['decoder_attention_mask'] = decoder_attention_mask
-            
-        return prepared_inputs
-
-    def _create_causal_mask(self, input_ids):
-        """Create causal attention mask for decoder"""
-        if input_ids is None:
-            return None
-            
-        batch_size, seq_length = input_ids.shape
-        mask = torch.triu(
-            torch.ones((seq_length, seq_length), dtype=torch.bool),
-            diagonal=1
-        )
-        mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
-        return mask
-
-    def _handle_seq2seq_gradients(self, loss, encoder_outputs=None):
-        """Specialized gradient handling for encoder-decoder models"""
-        if not self.is_peft_model:
-            return loss
-
-        # Apply different scaling for encoder and decoder
-        encoder_params = []
-        decoder_params = []
-        shared_params = []
-        
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-                
-            if 'encoder' in name:
-                encoder_params.append(param)
-            elif 'decoder' in name:
-                decoder_params.append(param)
-            else:
-                shared_params.append(param)
-        
-        # Scale gradients differently based on PEFT type
-        if hasattr(self.model, 'peft_config'):
-            peft_type = self.model.peft_config.peft_type
-            if peft_type == "LORA":
-                # More aggressive updates for decoder
-                for param in decoder_params:
-                    if param.grad is not None:
-                        param.grad *= 1.2
-                # More conservative updates for encoder
-                for param in encoder_params:
-                    if param.grad is not None:
-                        param.grad *= 0.8
-        
-        return loss
-
-    def _setup_gradient_checkpointing(self):
-        """Enhanced gradient checkpointing for seq2seq models"""
-        if not self.args.gradient_checkpointing:
-            return
-            
-        # Enable gradient checkpointing
-        self.model.encoder.gradient_checkpointing_enable()
-        self.model.decoder.gradient_checkpointing_enable()
-        
-        # Selective activation caching
-        if self.use_selective_activation_cache:
-            if hasattr(self.model.encoder, "enable_selective_activation_cache"):
-                self.model.encoder.enable_selective_activation_cache()
-            if hasattr(self.model.decoder, "enable_selective_activation_cache"):
-                self.model.decoder.enable_selective_activation_cache()
-
-    def _optimize_beam_search(self, **kwargs):
-        """Memory-efficient beam search implementation"""
-        if not self.is_peft_model:
-            return kwargs
-            
-        # Optimize memory usage for PEFT models during beam search
-        kwargs['use_cache'] = False  # Disable KV cache
-        
-        # Adjust beam size based on available memory
-        if self.args.num_beams > 4 and torch.cuda.is_available():
-            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-            if free_memory < 4 * 1024 * 1024 * 1024:  # Less than 4GB free
-                kwargs['num_beams'] = min(self.args.num_beams, 4)
-                
-        return kwargs
+    def _check_is_peft_model(self, model):
+        """Check if the model is a PEFT model"""
+        try:
+            from peft import PeftModel
+            is_peft = isinstance(model, PeftModel)
+            if is_peft:
+                logger.info(f"Detected PEFT model: {type(model).__name__}")
+                # Log trainable parameters for PEFT model
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                logger.info(f"Number of trainable parameters: {trainable_params}")
+            return is_peft
+        except ImportError:
+            logger.info("PEFT not installed, continuing with standard training")
+            return False
 
     def train(self):
         """Train the model, with special handling for PEFT models"""
@@ -453,56 +507,6 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
                 
         return sampler
     
-    def prediction_step(
-        self,
-        model,
-        inputs,
-        prediction_loss_only,
-        ignore_keys=None,
-    ):
-        """
-        Override prediction_step to handle PEFT models with special generation parameters
-        """
-        if self.is_peft_model and not prediction_loss_only:
-            # For generation with PEFT models, we need special handling
-            try:
-                # Extract the generation kwargs from the model
-                generation_kwargs = {}
-                
-                # Set max length if not provided
-                if not hasattr(self.generation_config, "max_length") and not hasattr(self.generation_config, "max_new_tokens"):
-                    generation_kwargs["max_length"] = self.args.max_length
-                
-                # For LoRA in particular, some generation settings may need adjustment
-                peft_type = getattr(getattr(self.model, "peft_config", None), "peft_type", None)
-                if peft_type and "LORA" in str(peft_type):
-                    # LoRA models might need adjusted temperature/top_p for best generation
-                    if hasattr(self.generation_config, "temperature") and self.generation_config.temperature == 1.0:
-                        # Only adjust if user hasn't explicitly set these
-                        logger.info("Adjusting default temperature for LoRA generation")
-                        generation_kwargs["temperature"] = 0.7
-                
-                logger.debug(f"Using generation kwargs for PEFT model: {generation_kwargs}")
-                
-                # Pass these generation configs to the parent method
-                return super().prediction_step(
-                    model, 
-                    inputs, 
-                    prediction_loss_only,
-                    ignore_keys=ignore_keys,
-                    **generation_kwargs
-                )
-            except Exception as e:
-                logger.warning(f"Error in PEFT prediction_step, falling back to default: {e}")
-                
-        # For non-PEFT models or if PEFT handling fails, use default behavior
-        return super().prediction_step(
-            model, 
-            inputs, 
-            prediction_loss_only,
-            ignore_keys=ignore_keys,
-        )
-    
     def print_args(self):
         print(self.args)
 
@@ -511,49 +515,96 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer):
         if self.is_peft_model:
             print("(with PEFT support)")
 
-    def training_step(self, model, inputs):
-        """Enhanced training step with specialized seq2seq handling"""
-        # Setup gradient checkpointing
-        self._setup_gradient_checkpointing()
-        
-        # Prepare inputs with attention patterns
-        inputs = self._prepare_inputs(inputs)
+    def training_step(self, model, inputs, **kwargs):
+        """Enhanced training step with sequence-to-sequence optimizations."""
+        # Apply label smoothing if configured
+        if self.args.label_smoothing_factor > 0:
+            inputs = self._apply_label_smoothing(inputs)
+            
+        # Apply sequence length optimization
+        inputs = self._optimize_sequence_length(inputs)
         
         # Forward pass with teacher forcing
-        if random.random() < self.teacher_forcing_ratio:
-            outputs = model(**inputs)
-        else:
-            with torch.no_grad():
-                generated = model.generate(
-                    inputs['input_ids'],
-                    attention_mask=inputs.get('attention_mask'),
-                    **self._optimize_beam_search()
-                )
-            outputs = model(**inputs, decoder_input_ids=generated)
+        outputs = model(**inputs)
         
-        loss = outputs.loss
+        # Handle gradients with PEFT awareness
+        if self.is_peft_model:
+            outputs["loss"] = self._handle_gradients(outputs["loss"])
+            self._scale_gradients()
+            
+        return outputs
+
+    def _apply_label_smoothing(self, inputs):
+        """Apply label smoothing to target sequences."""
+        if "labels" in inputs:
+            labels = inputs["labels"].clone()
+            ignore_index = -100
+            
+            # Create smoothing mask
+            vocab_size = self.model.config.vocab_size
+            smoothing_value = self.args.label_smoothing_factor / (vocab_size - 1)
+            
+            # Apply smoothing only to non-ignored indices
+            mask = labels != ignore_index
+            labels[mask] = ((1 - self.args.label_smoothing_factor) * torch.nn.functional.one_hot(labels[mask], vocab_size) + 
+                          smoothing_value)
+            
+            inputs["labels"] = labels
+            
+        return inputs
+
+    def _optimize_sequence_length(self, inputs):
+        """Optimize sequence lengths for better memory usage."""
+        max_length = self.model.config.max_position_embeddings
         
-        # Handle gradients
-        loss = self._handle_seq2seq_gradients(loss, outputs.get('encoder_outputs', None))
-        
-        return loss
+        # Dynamically adjust sequence length
+        if "input_ids" in inputs and inputs["input_ids"].shape[1] > max_length:
+            # Truncate while preserving important tokens
+            inputs["input_ids"] = inputs["input_ids"][:, :max_length]
+            if "attention_mask" in inputs:
+                inputs["attention_mask"] = inputs["attention_mask"][:, :max_length]
+            if "labels" in inputs:
+                inputs["labels"] = inputs["labels"][:, :max_length]
+                
+        return inputs
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """Enhanced prediction step with memory optimizations"""
-        inputs = self._prepare_inputs(inputs)
-        
-        generation_kwargs = self._optimize_beam_search()
-        
-        # Generate with optimized memory usage
-        with torch.no_grad():
-            generated_tokens = model.generate(
+        """Enhanced prediction step with optimized generation."""
+        if not prediction_loss_only:
+            # Use optimized generation config
+            generation_outputs = model.generate(
                 inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                **generation_kwargs,
+                attention_mask=inputs.get("attention_mask", None),
+                generation_config=self.generation_config,
+                synced_gpus=True if self.is_peft_model else False,
+                **self._get_generation_kwargs()
             )
             
-        if prediction_loss_only:
-            return (None, None, None)
+            # Compute loss
+            with torch.no_grad():
+                outputs = model(**inputs)
+                
+            return (outputs.loss, generation_outputs, inputs["labels"])
             
-        labels = inputs["labels"] if "labels" in inputs else None
-        return (None, generated_tokens, labels)
+        # Standard loss computation for training
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+
+    def _get_generation_kwargs(self):
+        """Get optimized generation kwargs based on task type."""
+        kwargs = {}
+        
+        if self.task_type == "summarization":
+            kwargs.update({
+                "min_length": self.specs.get("min_length", 10),
+                "max_length": self.specs.get("max_length", 128),
+                "length_penalty": self.specs.get("length_penalty", 2.0),
+                "no_repeat_ngram_size": self.specs.get("no_repeat_ngram_size", 3)
+            })
+        elif self.task_type == "translation":
+            kwargs.update({
+                "max_length": self.specs.get("max_length", 128),
+                "num_beams": self.specs.get("num_beams", 4),
+                "length_penalty": self.specs.get("length_penalty", 0.6)
+            })
+            
+        return kwargs

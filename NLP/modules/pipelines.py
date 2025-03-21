@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple, Union
 
 # Third-party imports
 import evaluate
@@ -21,11 +21,16 @@ from transformers import (
     DataCollatorForSeq2Seq,
     DataCollatorForTokenClassification,
     default_data_collator,
-    pipeline
+    pipeline,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+    Trainer,
+    TrainingArguments
 )
 import time
 import mlflow
 from datetime import datetime
+from dataclasses import dataclass, field
 
 # Local imports
 currdir = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +68,12 @@ from model_modules import ModelModules
 from tokenizer_modules import TokenizerModules
 from distributed_manager import DistributedManager, DistributedConfig, DistributedBackend
 from .error_handler import ErrorHandler
+from .training_optimizations import OptimizationConfig, TrainingOptimizer
+from .distributed_training import DistributedTrainer
+from .curriculum_learning import CurriculumConfig, CurriculumManager
+from .few_shot_adaptation import FewShotConfig, FewShotAdapter
+from .distillation import DistillationConfig, DistillationManager
+from .mlflow_tracking import MLflowTracker
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -428,558 +439,584 @@ class InferencePipeLine():
         # Fallback to the first adapter if no match is found
         return self.adapter_manager.list_adapters()[0]['id']
 
-class FineTunePipeLine():
-    def __init__(self, args_dir, task_type,
-                chosen_metric=None, quantization=None,
-                peft_method=None, peft_config=None, use_lightning=False, use_accelerate=False):
-        """
-        Initialize the fine-tuning pipeline.
-        
-        Args:
-            args_dir: Directory containing configuration arguments
-            task_type: Type of task (e.g., masked_language_modeling, token_classification)
-            chosen_metric: Metric to use for evaluation
-            quantization: Quantization configuration
-            peft_method: PEFT method to use
-            peft_config: PEFT configuration
-            use_lightning: Whether to use PyTorch Lightning
-            use_accelerate: Whether to use Hugging Face Accelerate
-        """
-        self.args_dir = args_dir
-        self.task_type = task_type
-        self.specs = {**DEFAULT_SPECS}
-        if args_dir is not None:
-            try:
-                with open(args_dir, 'r') as f:
-                    user_config = json.load(f)
-                self.specs.update(user_config)
-            except FileNotFoundError:
-                ErrorHandler.handle_error("IO_ERROR", f"Configuration file not found: {args_dir}")
-            except json.JSONDecodeError:
-                ErrorHandler.handle_error("CONFIG_ERROR", f"Invalid JSON in configuration file: {args_dir}")
-        
-        self.chosen_metric = chosen_metric
-        self.quantization = quantization
-        self.peft_method = peft_method
-        self.peft_config = peft_config
-        self.use_lightning = use_lightning
-        self.use_accelerate = use_accelerate
-        
-        # Setup MLflow if enabled
-        self.use_mlflow = self.specs.get("use_mlflow", False)
-        if self.use_mlflow:
-            self._setup_mlflow()
-        
-        # Initialize managers and modules
+class FineTuneConfig:
+    """Configuration for fine-tuning pipeline.
+    
+    Attributes:
+        task_type: Type of fine-tuning task
+        model_name: Name or path of the model
+        optimization: Training optimization configuration
+        distributed: Distributed training configuration
+        curriculum: Curriculum learning configuration
+        few_shot: Few-shot adaptation configuration
+        distillation: Knowledge distillation configuration
+        mlflow_tracking: Whether to track metrics with MLflow
+    """
+    task_type: str
+    model_name: str
+    optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
+    distributed: Optional[DistributedConfig] = None
+    curriculum: Optional[CurriculumConfig] = None
+    few_shot: Optional[FewShotConfig] = None
+    distillation: Optional[DistillationConfig] = None
+    mlflow_tracking: bool = True
+
+class FineTunePipeline:
+    """Advanced fine-tuning pipeline with optimizations."""
+    
+    def __init__(
+        self,
+        config: FineTuneConfig,
+        model: Optional[PreTrainedModel] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None
+    ):
         try:
-            self.checkpoint_manager = CheckpointManager(
-                base_dir=self.specs.get("output_dir", "checkpoints"),
-                max_checkpoints=self.specs.get("max_checkpoints", 3)
-            )
+            self.config = config
+            self.model = model
+            self.tokenizer = tokenizer
             
-            if self.quantization:
-                self.quantization_manager = QuantizationManager()
-                
-            self.type_utils = TypeUtils()
+            # Validate configuration
+            self._validate_config()
             
-            # Initialize model and tokenizer modules
-            logger.info("Initializing model and tokenizer modules")
-            self.model_modules = ModelModules(self.specs)
-            self.tokenizer_modules = TokenizerModules(self.specs)
+            # Initialize MLflow tracking
+            self.mlflow_tracker = None
+            if config.mlflow_tracking:
+                try:
+                    self.mlflow_tracker = MLflowTracker("fine_tuning")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize MLflow tracking: {str(e)}")
             
-            # Initialize dataset modules
-            logger.info("Initializing dataset modules")
-            self.dataset_modules = DatasetModules(
-                self.specs.get("dataset_dir"), 
-                self.tokenizer_modules.load_tokenizer(), 
-                self.specs
-            )
-            
-            # Determine trainer class
+            # Get appropriate trainer class
             self.trainer_class = self._get_trainer_class()
             
+            # Initialize components with error handling
+            self._initialize_components()
+            
         except Exception as e:
-            ErrorHandler.handle_error("TRAINING_ERROR", str(e))
+            logger.error(f"Error initializing FineTunePipeline: {str(e)}")
             raise
 
-    def _setup_mlflow(self):
-        """
-        Setup MLflow tracking.
-        
-        Initializes the MLflow experiment, starts a run, and logs initial metadata.
-        If an error occurs during setup, MLflow tracking is disabled.
-        """
-        self.experiment_name = self.specs.get("experiment_name", "default_experiment")
-        self.tracking_uri = self.specs.get("tracking_uri", "sqlite:///mlflow.db")
-        
-        try:
-            # Set tracking URI and experiment
-            mlflow.set_tracking_uri(self.tracking_uri)
-            mlflow.set_experiment(self.experiment_name)
+    def _validate_config(self):
+        """Validate the configuration settings."""
+        if not self.config.task_type:
+            raise ValueError("task_type must be specified in config")
+        if not self.config.model_name:
+            raise ValueError("model_name must be specified in config")
             
-            # Start MLflow run
-            run_name = f"finetune_{self.task_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.run = mlflow.start_run(run_name=run_name)
-            self.run_id = self.run.info.run_id
+        # Validate task type
+        valid_task_types = [
+            "classification", "token-classification", "summarization",
+            "translation", "question-answering", "language-modeling"
+        ]
+        if self.config.task_type not in valid_task_types:
+            raise ValueError(f"Invalid task_type: {self.config.task_type}. Must be one of {valid_task_types}")
             
-            # Log initial metadata
-            mlflow.log_param("start_time", datetime.now().isoformat())
-            mlflow.log_param("task_type", self.task_type)
-            mlflow.log_param("model_name", self.specs.get("model_name", "unknown"))
-            mlflow.log_param("data_source", self.specs.get("dataset_dir", "unknown"))
-            mlflow.log_param("quantization", self.quantization)
-            mlflow.log_param("peft_method", self.peft_method)
-            mlflow.log_param("use_lightning", self.use_lightning)
-            mlflow.log_param("use_accelerate", self.use_accelerate)
-            
-            # Log specifications
-            mlflow.log_dict(self.specs, "specs.json")
-            
-            logger.info(f"MLflow tracking initialized. Run ID: {self.run_id}")
-        except Exception as e:
-            logger.warning(f"Failed to initialize MLflow tracking: {e}")
-            self.use_mlflow = False
+        # Validate optimization settings
+        if self.config.optimization:
+            if self.config.optimization.use_lightning and not self._is_lightning_available():
+                logger.warning("PyTorch Lightning not available, falling back to standard training")
+                self.config.optimization.use_lightning = False
+                
+            if self.config.optimization.use_accelerate and not self._is_accelerate_available():
+                logger.warning("Accelerate not available, falling back to standard training")
+                self.config.optimization.use_accelerate = False
 
-    def _prepare_fallback_optimizer(self, model):
-        """
-        Prepare a fallback optimizer in case the trainer doesn't have its own.
-        
-        Args:
-            model: The model to optimize
-        
-        Returns:
-            The prepared optimizer
-        """
+    def _initialize_components(self):
+        """Initialize all pipeline components with error handling."""
         try:
-            return AdamW(
-                model.parameters(),
-                lr=self.specs['learning_rate'],
-                weight_decay=self.specs['weight_decay']
+            # Initialize optimization components
+            self.training_optimizer = TrainingOptimizer(
+                self.model,
+                self.config.optimization
             )
-        except Exception as e:
-            ErrorHandler.handle_error("TRAINING_ERROR", f"Failed to create optimizer: {str(e)}")
-            return None
-
-    def _prepare_fallback_data_collator(self, tokenizer, model=None):
-        """
-        Prepare a fallback data collator in case the trainer doesn't have its own.
-        
-        Args:
-            tokenizer: The tokenizer to use
-            model: The model (required for some collators)
-        
-        Returns:
-            The prepared data collator
-        """
-        try:
-            if self.task_type == "masked_language_modeling":
-                return DataCollatorForLanguageModeling(
-                    tokenizer=tokenizer,
-                    mlm_probability=self.specs['mlm_probability']
+            
+            # Initialize distributed training if configured
+            self.distributed_trainer = None
+            if self.config.distributed and torch.cuda.device_count() > 1:
+                try:
+                    self.distributed_trainer = DistributedTrainer(
+                        self.model,
+                        self.config.distributed,
+                        self.config.optimization
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize distributed training: {str(e)}")
+                    
+            # Initialize curriculum learning if configured
+            self.curriculum_manager = None
+            if self.config.curriculum:
+                try:
+                    self.curriculum_manager = CurriculumManager(
+                        self.model,
+                        self.tokenizer,
+                        self.config.curriculum
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize curriculum learning: {str(e)}")
+                    
+            # Initialize few-shot adaptation if configured
+            self.few_shot_adapter = None
+            if self.config.few_shot:
+                try:
+                    self.few_shot_adapter = FewShotAdapter(
+                        self.model,
+                        self.tokenizer,
+                        self.config.few_shot
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize few-shot adaptation: {str(e)}")
+                    
+            # Initialize knowledge distillation if configured
+            self.distillation_manager = None
+            if self.config.distillation:
+                try:
+                    self.distillation_manager = DistillationManager(
+                        self.model,
+                        None,
+                        self.tokenizer,
+                        self.config.distillation
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize knowledge distillation: {str(e)}")
+            
+            # Initialize checkpoint manager
+            try:
+                self.checkpoint_manager = CheckpointManager(
+                    base_path=os.path.join("checkpoints", self.config.task_type),
+                    model_name=self.config.model_name
                 )
-            elif self.task_type == "token_classification":
-                return DataCollatorForTokenClassification(tokenizer=tokenizer)
-            elif self.task_type in ["translation", "summarization", "text_generation"]:
-                return DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
-            elif self.task_type == "question_answering":
-                return default_data_collator
-            else:
-                ErrorHandler.handle_error("TASK_TYPE_ERROR", self.task_type)
-                return default_data_collator
+            except Exception as e:
+                logger.error(f"Failed to initialize checkpoint manager: {str(e)}")
+                raise
+            
+            # Initialize metrics
+            self._initialize_metrics()
+            
         except Exception as e:
-            ErrorHandler.handle_error("TRAINING_ERROR", f"Failed to create data collator: {str(e)}")
-            return default_data_collator
+            logger.error(f"Error initializing components: {str(e)}")
+            raise
+
+    def _initialize_metrics(self):
+        """Initialize evaluation metrics based on task type."""
+        try:
+            self.metric = None
+            if self.config.task_type in ["classification", "token-classification"]:
+                self.metric = evaluate.load("accuracy")
+            elif self.config.task_type in ["summarization", "translation"]:
+                self.metric = evaluate.load("rouge")
+            elif self.config.task_type == "question-answering":
+                self.metric = evaluate.load("squad")
+        except Exception as e:
+            logger.warning(f"Failed to initialize metrics: {str(e)}")
+
+    @staticmethod
+    def _is_lightning_available():
+        """Check if PyTorch Lightning is available."""
+        try:
+            import pytorch_lightning
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _is_accelerate_available():
+        """Check if Accelerate is available."""
+        try:
+            import accelerate
+            return True
+        except ImportError:
+            return False
 
     def _get_trainer_class(self):
-        """
-        Get the appropriate trainer class based on configuration.
+        """Get the appropriate trainer class based on task type and configuration."""
+        is_seq2seq = self.config.task_type in ["summarization", "translation"]
+        use_lightning = getattr(self.config.optimization, "use_lightning", False)
+        use_accelerate = getattr(self.config.optimization, "use_accelerate", False)
         
-        The selection logic works as follows:
-        1. If Lightning is enabled, use Lightning-based trainers
-        2. If Accelerate is enabled but not Lightning, use Accelerate-based trainers
-        3. If neither is enabled, use standard trainers
-        
-        For each case, select Seq2Seq trainers for generation tasks,
-        or standard trainers for other tasks.
-        
-        Returns:
-            The appropriate trainer class based on the task type and acceleration settings
-        """
-        if self.use_lightning:
-            if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
-                return AcceleratedNLPSeq2SeqTrainerWithLightning
-            return AcceleratedNLPTrainerWithLightning
-        elif self.use_accelerate:
-            if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
-                return AcceleratedNLPSeq2SeqTrainer
-            return AcceleratedNLPTrainer
-        else:
-            if self.task_type == "seq2seq" or self.task_type in ["translation", "summarization", "text_generation"]:
-                return NLPSeq2SeqTrainer
-            return NLPTrainer
-        
-    def run(self):
-        """
-        Run the fine-tuning pipeline.
-        
-        This method orchestrates the entire fine-tuning process:
-        1. Load and configure the model and tokenizer
-        2. Apply quantization if specified
-        3. Apply PEFT methods if specified
-        4. Prepare datasets for the task
-        5. Set up training callbacks
-        6. Initialize and run the trainer
-        7. Save the model and checkpoints
-        8. Log final metrics
-        
-        Returns:
-            The trained model and tokenizer
-        """
-        logger.info(f"Starting fine-tuning for task: {self.task_type}")
-        start_time = time.time()
-        
-        try:
-            # Load model and tokenizer with appropriate quantization
-            model_kwargs = {}
-            if self.quantization:
-                logger.info(f"Preparing model for quantization: {self.quantization}")
-                model_kwargs = self.quantization_manager.prepare_model_for_quantization(
-                    model_name_or_path=self.specs.get("model_name_or_path", ""),
-                    quant_type=self.quantization,
-                    custom_quantization_config=self.specs.get("quantization_config", None)
-                )
-                
-            # Load model
-            logger.info("Loading model")
-            model = self.model_modules.load_model(self.task_type, model_kwargs)
-            
-            # Load tokenizer
-            logger.info("Loading tokenizer")
-            tokenizer = self.tokenizer_modules.load_tokenizer()
-            
-            # Optimize memory layout
-            logger.info("Optimizing memory layout")
-            model = self.type_utils.optimize_memory_layout(model, self.peft_method)
-        
-            # Apply PEFT if specified
-            if self.peft_method:
-                logger.info(f"Applying PEFT method: {self.peft_method}")
-                
-                # Check compatibility with quantization
-                if self.quantization:
-                    is_compatible, reason = self.quantization_manager.check_peft_compatible(
-                        model, self.peft_method
-                    )
-                    if not is_compatible:
-                        logger.warning(f"Warning: {reason}")
-                    
-                    # Optimize for PEFT with quantization
-                    model = self.quantization_manager.optimize_model_for_peft(
-                        model, self.quantization, self.peft_method
-                    )
-                    
-                model, tokenizer = self.model_modules.apply_peft(
-                    model=model,
-                    tokenizer=tokenizer,
-                    peft_method=self.peft_method,
-                    peft_config=self.peft_config,
-                    task_type=self.task_type
-                )
-                
-                # Validate parameter types
-                self.type_utils.check_parameter_types(model)
-            
-            # Load dataset
-            logger.info("Loading dataset")
-            raw_dataset = self.dataset_modules.load_dataset()
-            
-            # Preprocess dataset based on task type
-            logger.info("Preprocessing dataset")
-            if self.task_type == "masked_language_modeling":
-                train_dataset, eval_dataset = self.dataset_modules.prepare_mlm(raw_dataset, tokenizer, self.specs)
-            elif self.task_type == "token_classification":
-                train_dataset, eval_dataset = self.dataset_modules.prepare_token_classification(raw_dataset, tokenizer, self.specs)
-            elif self.task_type == "translation":
-                train_dataset, eval_dataset = self.dataset_modules.prepare_translation(raw_dataset, tokenizer, self.specs)
-            elif self.task_type == "summarization":
-                train_dataset, eval_dataset = self.dataset_modules.prepare_summarization(raw_dataset, tokenizer, self.specs)
-            elif self.task_type == "text_generation":
-                train_dataset, eval_dataset = self.dataset_modules.prepare_text_generation(raw_dataset, tokenizer, self.specs)
-            elif self.task_type == "question_answering":
-                train_dataset, eval_dataset = self.dataset_modules.prepare_question_answering(raw_dataset, tokenizer, self.specs)
-            else:
-                ErrorHandler.handle_error("TASK_TYPE_ERROR", self.task_type)
-                return None, None
-            
-            # Log dataset information if MLflow is enabled
-            if self.use_mlflow:
-                mlflow.log_param("train_dataset_size", len(train_dataset))
-                mlflow.log_param("eval_dataset_size", len(eval_dataset))
-            
-            # Setup callbacks
-            callbacks = []
-            
-            # Add MLflow callback if enabled
-            if self.use_mlflow and hasattr(self, 'run_id'):
-                logger.info("Adding MLflow callback")
-                mlflow_callback = MLflowCallback(self.run_id)
-                callbacks.append(mlflow_callback)
-            
-            # Add PEFT-specific callbacks for Lightning
-            if self.use_lightning and self.peft_method:
-                # Add PEFT monitoring callback
-                logger.info("Setting up PEFT monitoring callbacks")
-                peft_monitor = PeftAdapterMonitorCallback(
-                    monitor_gradients=True,
-                    monitor_weights=True,
-                    log_every_n_steps=100,
-                    save_path=os.path.join(self.specs["output_dir"], "peft_monitoring")
-                )
-                callbacks.append(peft_monitor)
-                
-                # Only add pruning if enabled in specs
-                if self.specs.get("peft_pruning_enabled", False):
-                    logger.info("Setting up PEFT pruning callback")
-                    peft_pruning = PeftEarlyPruningCallback(
-                        start_pruning_epoch=1,
-                        pruning_threshold=self.specs.get("peft_pruning_threshold", 0.01),
-                        final_sparsity=self.specs.get("peft_pruning_sparsity", 0.3)
-                    )
-                    callbacks.append(peft_pruning)
-            
-            # Prepare fallback optimizer and data collator
-            logger.info("Preparing optimizer and data collator")
-            fallback_optimizer = self._prepare_fallback_optimizer(model)
-            fallback_data_collator = self._prepare_fallback_data_collator(tokenizer, model)
-            
-            # Initialize the trainer
-            logger.info(f"Initializing trainer: {self.trainer_class.__name__}")
-            trainer_kwargs = {
-                "args_dir": self.args_dir,
-                "model": model,
-                "tokenizer": tokenizer,
-                "train_dataset": train_dataset,
-                "eval_dataset": eval_dataset,
-                "raw_dataset": raw_dataset,
-                "task_type": self.task_type,
-                "chosen_metric": self.chosen_metric,
-                "specs": self.specs,
-                "fallback_optimizer": fallback_optimizer,
-                "fallback_data_collator": fallback_data_collator
-            }
-            
-            # Add callbacks if available
-            if callbacks:
-                trainer_kwargs["callbacks"] = callbacks
-            
-            # Create trainer instance
-            trainer = self.trainer_class(**trainer_kwargs)
-            
-            # Run the training process
-            logger.info(f"Starting training with {'Lightning' if self.use_lightning else 'standard'} trainer")
-            if self.use_lightning:
-                trainer.fit()
-            else:
-                trainer.train()
-            
-            # Save model and checkpoint
-            logger.info("Saving model and checkpoint")
-            self.save_model_and_checkpoint(model, tokenizer, trainer)
-            
-            # Log final metrics to MLflow if enabled
-            if self.use_mlflow:
-                total_duration = time.time() - start_time
-                mlflow.log_metric("total_training_duration", total_duration)
-                mlflow.log_param("end_time", datetime.now().isoformat())
-                
-                # Log model artifacts
-                model_path = os.path.join(self.specs["output_dir"])
-                if os.path.exists(model_path):
-                    mlflow.log_artifact(model_path, "final_model")
-                
-                # End MLflow run
-                mlflow.end_run()
-            
-            logger.info("Training complete")
-            return model, tokenizer
-            
-        except Exception as e:
-            # End MLflow run if active
-            if self.use_mlflow:
-                mlflow.end_run(status="FAILED")
-                
-            ErrorHandler.handle_error("TRAINING_ERROR", str(e), logger=logger)
-            import traceback
-            traceback.print_exc()
-            return None, None
-
-    def save_model_and_checkpoint(self, model, tokenizer, trainer):
-        """Save the model, tokenizer, and create a checkpoint."""
-        output_dir = self.specs["output_dir"]
-        
-        # For PEFT models, use different saving approach
-        if self.peft_method:
-            # Save using the checkpoint manager
-            self.checkpoint_manager.save_checkpoint(
-                model=model,
-                tokenizer=tokenizer,
-                output_dir=output_dir,
-                epoch=self.specs.get("num_train_epochs", 3),
-                is_best=True
+        if use_lightning and use_accelerate:
+            logger.info("Using Lightning with Accelerate integration")
+            return (
+                AcceleratedNLPSeq2SeqTrainerWithLightning
+                if is_seq2seq
+                else AcceleratedNLPTrainerWithLightning
+            )
+        elif use_lightning:
+            logger.info("Using Lightning trainer")
+            return (
+                NLPSeq2SeqTrainerWithLightning
+                if is_seq2seq
+                else NLPTrainerWithLightning
+            )
+        elif use_accelerate:
+            logger.info("Using Accelerate trainer")
+            return (
+                AcceleratedNLPSeq2SeqTrainer
+                if is_seq2seq
+                else AcceleratedNLPTrainer
             )
         else:
-            # For regular models, we can use the trainer to save
-            if hasattr(trainer, "save_model"):
-                trainer.save_model(output_dir)
-            elif hasattr(model, "save_pretrained"):
-                model.save_pretrained(output_dir)
-                tokenizer.save_pretrained(output_dir)
-            else:
-                # Fallback for other model types
-                torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
-                tokenizer.save_pretrained(output_dir)
-    
-    def load_checkpoint(self, checkpoint_dir, convert_precision=None):
-        """
-        Load a checkpoint using the checkpoint manager.
-        
-        Args:
-            checkpoint_dir: Directory containing the checkpoint
-            convert_precision: Optional precision to convert to (fp16, bf16, fp32)
-            
-        Returns:
-            Tuple of (loaded_model, loaded_tokenizer)
-        """
-        # Load specs for model initialization
-        self.load_specs()
-        
-        # Load base model
-        model = self.model_modules.load_model(self.task_type)
-        tokenizer = self.tokenizer_modules.load_tokenizer()
-        
-        # Load checkpoint
-        model, tokenizer, meta = self.checkpoint_manager.load_checkpoint(
-            model=model,
-            tokenizer=tokenizer,
-            checkpoint_dir=checkpoint_dir,
-            target_precision=convert_precision
+            logger.info("Using standard trainer")
+            return NLPSeq2SeqTrainer if is_seq2seq else NLPTrainer
+
+    def _initialize_trainer(self, train_dataset, eval_dataset, **kwargs):
+        """Initialize the appropriate trainer with all necessary components."""
+        # Prepare training arguments
+        training_args = TrainingArguments(
+            output_dir=os.path.join("checkpoints", self.config.task_type),
+            **self.config.optimization.__dict__
         )
         
-        return model, tokenizer, meta
-
-    def postprocess(self, predictions, labels):
-        predictions = predictions.detach().cpu().clone().numpy()
-        labels = labels.detach().cpu().clone().numpy()
+        # Get data collator based on task type
+        data_collator = self._get_data_collator()
         
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-
-        # Remove ignored index (special tokens) and convert to labels
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        true_predictions = [pred.strip() for pred in decoded_preds]
-        true_labels = [label.strip() for label in decoded_labels]
-
-        return true_labels, true_predictions
-    
-    def prepare_dataset(self, dataset=None, huggingface_dataset=None):
-        dataset_modules = DatasetModules(self.dataset_dir, self.tokenizer, self.specs)
+        # Initialize trainer
+        trainer = self.trainer_class(
+            args_dir=training_args,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            task_type=self.config.task_type,
+            compute_metrics=self.compute_metrics,
+            callbacks=[MLflowCallback(self.mlflow_tracker.run_id)] if self.mlflow_tracker else None,
+            **kwargs
+        )
         
-        if dataset is not None:
-            self.raw_dataset = dataset
-            self.dataset = dataset_modules.prepare_dataset(self.raw_dataset)
-        elif self.dataset_dir is not None:
-            self.raw_dataset = dataset_modules.prepare_dataset_from_dir(self.task_type)
-            self.dataset = dataset_modules.prepare_dataset(self.raw_dataset)
-        else:
-            self.raw_dataset = dataset_modules.load_dataset(huggingface_dataset)
-            self.dataset = dataset_modules.prepare_dataset(self.raw_dataset)
+        return trainer
 
-    def get_compute_metrics(self, task_type, chosen_metric):
-        self.metric = evaluate.load_metric(chosen_metric)
-        if task_type == "token_classification":
-            def compute_metrics(eval_pred):
-                # TO ADD LATER
-                pass
-        elif task_type == "masked_language_modeling":
-            def compute_metrics(eval_pred):
-                # TO ADD LATER
-                pass
-        elif task_type == "translation":
-            def compute_metrics(eval_pred):
-                predictions, labels = eval_pred
-                true_labels, true_predictions = self.postprocess(predictions, labels)
-                return self.metric.compute(predictions=true_predictions, references=true_labels)
-        elif task_type == "summarization":
-            def compute_metrics(eval_pred):
-                predictions, labels = eval_pred
-                true_labels, true_predictions = self.postprocess(predictions, labels)
-                if chosen_metric == "rouge":
-                    true_predictions = ["\n".join(nltk.sent_tokenize(pred)) for pred in true_predictions]
-                    true_labels = ["\n".join(nltk.sent_tokenize(label)) for label in true_labels]
-                    result = self.metric.compute(predictions=true_predictions, references=true_labels, use_stemmer=True)
-                    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-                    return result
-                else:
-                    return self.metric.compute(predictions=true_predictions, references=true_labels)
-        elif task_type == "text_generation":
-            def compute_metrics(eval_pred):
-                predictions, labels = eval_pred
-                true_labels, true_predictions = self.postprocess(predictions, labels)
-                return self.metric.compute(predictions=true_predictions, references=true_labels)
-        return compute_metrics
-
-    def compute_qna_metrics(self, start_logits, end_logits, eval_dataset, raw_eval_dataset, chosen_metric, max_answer_length):
-        self.metric = evaluate.load_metric(chosen_metric)
-        example_to_features = collections.defaultdict(list)
-        for idx, feature in enumerate(eval_dataset):
-            example_to_features[feature["example_id"]].append(idx)
-
-        predicted_answers = []
-        for example in raw_eval_dataset:
-            example_id = example["id"]
-            context = example["context"]
-            answers = []
-
-            # Loop through all features associated with that example
-            for feature_index in example_to_features[example_id]:
-                start_logit = start_logits[feature_index]
-                end_logit = end_logits[feature_index]
-                offsets = eval_dataset[feature_index]["offset_mapping"]
-
-                start_indexes = np.argsort(start_logit)[-1 : -5 - 1 : -1].tolist()
-                end_indexes = np.argsort(end_logit)[-1 : -5 - 1 : -1].tolist()
-                for start_index in start_indexes:
-                    for end_index in end_indexes:
-                        # Skip answers that are not fully in the context
-                        if offsets[start_index] is None or offsets[end_index] is None:
-                            continue
-                        # Skip answers with a length that is either < 0 or > max_answer_length
-                        if (
-                            end_index < start_index or end_index - start_index + 1 > max_answer_length
-                        ):
-                            continue
-
-                        answer = {
-                            "text": context[offsets[start_index][0] : offsets[end_index][1]],
-                            "logit_score": start_logit[start_index] + end_logit[end_index],
-                        }
-                        answers.append(answer)
-
-            # Select the answer with the best score
-            if len(answers) > 0:
-                best_answer = max(answers, key=lambda x: x["logit_score"])
-                predicted_answers.append(
-                    {"id": example_id, "prediction_text": best_answer["text"]}
+    def _get_data_collator(self):
+        """Get appropriate data collator based on task type."""
+        if self.config.task_type == "language-modeling":
+            return DataCollatorForLanguageModeling(
+                tokenizer=self.tokenizer,
+                mlm=True,
+                mlm_probability=0.15
+            )
+        elif self.config.task_type in ["summarization", "translation"]:
+            return DataCollatorForSeq2Seq(
+                tokenizer=self.tokenizer,
+                model=self.model,
+                padding=True
+            )
+        elif self.config.task_type == "token-classification":
+            return DataCollatorForTokenClassification(
+                tokenizer=self.tokenizer
                 )
-            else:
-                predicted_answers.append({"id": example_id, "prediction_text": ""})
+        else:
+            return default_data_collator
 
-        theoretical_answers = [{"id": ex["id"], "answers": ex["answers"]} for ex in raw_eval_dataset]
-        result = self.metric.compute(predictions=predicted_answers, references=theoretical_answers)
-        return result
+    def prepare_training_data(
+        self,
+        train_dataset: List[Dict],
+        eval_dataset: Optional[List[Dict]] = None,
+        batch_size: int = 32
+    ) -> Tuple[torch.utils.data.DataLoader, Optional[torch.utils.data.DataLoader]]:
+        """Prepare training and evaluation data with optimizations."""
+        if self.curriculum_manager:
+            # Apply curriculum learning
+            train_dataset = self.curriculum_manager.prepare_curriculum(train_dataset)
+            if eval_dataset:
+                eval_dataset = self.curriculum_manager.prepare_curriculum(eval_dataset)
+                
+        if self.few_shot_adapter:
+            # Apply few-shot adaptation
+            train_dataset = self.few_shot_adapter.prepare_dataset(train_dataset)
+            if eval_dataset:
+                eval_dataset = self.few_shot_adapter.prepare_dataset(eval_dataset)
+                
+        # Prepare optimized dataloaders
+        train_loader = self.training_optimizer.prepare_dataloader(
+            train_dataset,
+            batch_size=batch_size
+        )
+        
+        eval_loader = None
+        if eval_dataset:
+            eval_loader = self.training_optimizer.prepare_dataloader(
+                eval_dataset,
+                batch_size=batch_size,
+                shuffle=False
+            )
+            
+        return train_loader, eval_loader
+    
+    def _train_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        optimizer: torch.optim.Optimizer
+    ) -> Dict[str, float]:
+        """Perform one training step with all optimizations."""
+        def forward_func(batch_data):
+            outputs = self.model(**batch_data)
+            return outputs.loss
+            
+        metrics = self.training_optimizer.optimizer_step(
+            batch,
+            optimizer,
+            forward_func
+        )
+        
+        if self.curriculum_manager:
+            self.curriculum_manager.update_curriculum(metrics)
+            
+        if self.distributed_trainer:
+            metrics = self.distributed_trainer.reduce_metrics(metrics)
+            
+        return metrics
+    
+    def train(
+        self,
+        train_dataset: List[Dict],
+        eval_dataset: Optional[List[Dict]] = None,
+        num_epochs: int = 3,
+        batch_size: int = 32,
+        learning_rate: float = 5e-5,
+        **kwargs
+    ) -> PreTrainedModel:
+        """Run fine-tuning with all configured optimizations."""
+        if self.mlflow_tracker:
+            self.mlflow_tracker.start_run()
+            self.mlflow_tracker.log_params({
+                "task_type": self.config.task_type,
+                "model_name": self.config.model_name,
+                "num_epochs": num_epochs,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "trainer_type": self.trainer_class.__name__
+            })
+        
+        try:
+            # Initialize trainer
+            trainer = self._initialize_trainer(
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                learning_rate=learning_rate,
+                num_train_epochs=num_epochs,
+                per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=batch_size,
+                **kwargs
+            )
+            
+            # Apply curriculum learning if configured
+            if self.curriculum_manager:
+                train_dataset = self.curriculum_manager.prepare_curriculum(train_dataset)
+                if eval_dataset:
+                    eval_dataset = self.curriculum_manager.prepare_curriculum(eval_dataset)
+                    
+            # Apply few-shot adaptation if configured
+            if self.few_shot_adapter:
+                train_dataset = self.few_shot_adapter.prepare_dataset(train_dataset)
+                if eval_dataset:
+                    eval_dataset = self.few_shot_adapter.prepare_dataset(eval_dataset)
+            
+            # Set up distributed training if configured
+            if self.distributed_trainer:
+                trainer = self.distributed_trainer.wrap_trainer(trainer)
+            
+            # Set up knowledge distillation if configured
+            if self.distillation_manager:
+                trainer = self.distillation_manager.wrap_trainer(trainer)
+            
+            # Train the model
+            logger.info(f"Starting fine-tuning for task type: {self.config.task_type}")
+            train_result = trainer.train()
+            
+            # Log final metrics
+            metrics = train_result.metrics
+            if eval_dataset:
+                eval_metrics = trainer.evaluate()
+                metrics.update(eval_metrics)
+                
+            if self.mlflow_tracker:
+                self.mlflow_tracker.log_metrics(metrics)
+                
+            # Apply model pruning if enabled
+            self.training_optimizer.apply_pruning()
+            
+            # Save the final model
+            if trainer.is_world_process_zero():
+                trainer.save_model()
+                if self.mlflow_tracker:
+                    self.mlflow_tracker.log_artifact(trainer.args.output_dir)
+            
+            # Clean up
+            self.training_optimizer.cleanup()
+            if self.distributed_trainer:
+                self.distributed_trainer.cleanup()
+                
+            return self.model
+            
+        except Exception as e:
+            logger.error(f"Error during training: {str(e)}")
+            raise
+            
+        finally:
+            if self.mlflow_tracker:
+                self.mlflow_tracker.end_run()
+    
+    def _evaluate(
+        self,
+        eval_loader: torch.utils.data.DataLoader
+    ) -> Dict[str, float]:
+        """Evaluate model with optimizations."""
+        self.model.eval()
+        total_loss = 0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in eval_loader:
+                outputs = self.model(**batch)
+                total_loss += outputs.loss.item()
+                num_batches += 1
+                
+        metrics = {"eval_loss": total_loss / num_batches}
+        
+        if self.distributed_trainer:
+            metrics = self.distributed_trainer.reduce_metrics(metrics)
+            
+        return metrics
+    
+    def save_model(self, path: str):
+        """Save the fine-tuned model."""
+        if hasattr(self.model, "module"):  # Unwrap DDP
+            self.model.module.save_pretrained(path)
+        else:
+            self.model.save_pretrained(path)
+            
+        if self.mlflow_tracker:
+            self.mlflow_tracker.log_artifact(path)
+    
+    @classmethod
+    def load_model(
+        cls,
+        path: str,
+        config: FineTuneConfig
+    ) -> "FineTunePipeline":
+        """Load a fine-tuned model."""
+        model = PreTrainedModel.from_pretrained(path)
+        tokenizer = PreTrainedTokenizer.from_pretrained(path)
+        return cls(config, model, tokenizer)
+
+    def save_checkpoint(
+        self,
+        step: int,
+        epoch: int,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        metrics: Optional[Dict[str, float]] = None
+    ):
+        """Save training checkpoint with metadata."""
+        checkpoint_path = self.checkpoint_manager.save_checkpoint(
+            model=self.model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=step,
+            epoch=epoch,
+            metrics=metrics
+        )
+        
+        if self.mlflow_tracker:
+            self.mlflow_tracker.log_artifact(checkpoint_path)
+            
+        return checkpoint_path
+        
+    def load_checkpoint(
+        self,
+        checkpoint_path: str
+    ) -> Dict[str, Any]:
+        """Load checkpoint and return state dict."""
+        return self.checkpoint_manager.load_checkpoint(
+            model=self.model,
+            checkpoint_path=checkpoint_path
+        )
+        
+    def compute_metrics(
+        self,
+        eval_pred: Tuple[np.ndarray, np.ndarray]
+    ) -> Dict[str, float]:
+        """Compute task-specific evaluation metrics."""
+        predictions, labels = eval_pred
+        if self.config.task_type in ["classification", "token-classification"]:
+            predictions = np.argmax(predictions, axis=-1)
+            return self.metric.compute(predictions=predictions, references=labels)
+            
+        elif self.config.task_type in ["summarization", "translation"]:
+            decoded_preds = self.tokenizer.batch_decode(
+                predictions, skip_special_tokens=True
+            )
+            decoded_labels = self.tokenizer.batch_decode(
+                labels, skip_special_tokens=True
+            )
+            
+            # Rouge expects a newline after each sentence
+            decoded_preds = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
+            decoded_labels = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
+            
+            result = self.metric.compute(
+                predictions=decoded_preds,
+                references=decoded_labels,
+                use_stemmer=True
+            )
+            
+            # Extract median scores
+            result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+            return result
+            
+        elif self.config.task_type == "question-answering":
+            decoded_preds = self.tokenizer.batch_decode(
+                predictions, skip_special_tokens=True
+            )
+            decoded_labels = self.tokenizer.batch_decode(
+                labels, skip_special_tokens=True
+            )
+            
+            formatted_predictions = [{"id": str(i), "prediction_text": pred} for i, pred in enumerate(decoded_preds)]
+            formatted_references = [{"id": str(i), "answers": {"text": [label], "answer_start": [0]}} for i, label in enumerate(decoded_labels)]
+            
+            result = self.metric.compute(
+                predictions=formatted_predictions,
+                references=formatted_references
+            )
+            return result
+            
+        return {}
+        
+    def post_process_predictions(
+        self,
+        predictions: np.ndarray,
+        task_type: str
+    ) -> Union[List[str], List[Dict]]:
+        """Post-process model predictions based on task type."""
+        if task_type in ["classification", "token-classification"]:
+            return np.argmax(predictions, axis=-1).tolist()
+            
+        elif task_type in ["summarization", "translation", "text-generation"]:
+            return self.tokenizer.batch_decode(
+                predictions,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            
+        elif task_type == "question-answering":
+            start_logits, end_logits = predictions
+            
+            all_answers = []
+            for start, end in zip(start_logits, end_logits):
+                start_idx = np.argmax(start)
+                end_idx = np.argmax(end[start_idx:]) + start_idx
+                
+                answer = {
+                    "answer": self.tokenizer.decode(predictions[start_idx:end_idx+1]),
+                    "start": int(start_idx),
+                    "end": int(end_idx),
+                    "score": float(start[start_idx] * end[end_idx])
+                }
+                all_answers.append(answer)
+                
+            return all_answers
+            
+        return predictions.tolist()
 
 
 

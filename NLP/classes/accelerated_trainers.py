@@ -603,81 +603,194 @@ class AcceleratedNLPTrainer():
                 param.grad.data = param.grad.data * 0.8
 
     def _train_step(self, batch, step):
-        """Enhanced training step with PEFT-aware gradient handling"""
+        """
+        Execute a single training step with optimizations.
+        
+        Args:
+            batch: The current batch of data
+            step: The current training step
+            
+        Returns:
+            dict: Training metrics for this step
+        """
         try:
-            # Forward pass with Accelerator's autocast
+            self.model.train()
+            
+            # Apply memory optimizations
+            if self.specs.get('use_gradient_checkpointing', False):
+                self.model.gradient_checkpointing_enable()
+                
+            # Forward pass with automatic mixed precision
             with self.accelerator.autocast():
                 outputs = self.model(**batch)
                 loss = outputs.loss
-
-            # Handle gradients
-            loss = self._handle_gradients(loss, step)
-
-            # Update on accumulation step
+                
+            # Handle gradients with PEFT-specific optimizations
+            if self.is_peft_model:
+                loss = self._handle_gradients(loss, step)
+                self._scale_gradients()
+                
+            # Gradient accumulation if configured
+            if self.specs.get('gradient_accumulation_steps', 1) > 1:
+                loss = loss / self.specs['gradient_accumulation_steps']
+                
+            # Backward pass with gradient scaling
+            self.accelerator.backward(loss)
+            
+            # Gradient clipping
+            if self.specs.get('max_grad_norm', 0) > 0:
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.specs['max_grad_norm']
+                )
+                
+            # Update weights if gradient accumulation complete
             if (step + 1) % self.specs.get('gradient_accumulation_steps', 1) == 0:
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
-
-            # Log metrics
-            if self.specs.get('debug_gradients', False):
-                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-                grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params if p.grad is not None]))
-                logger.debug(f"Gradient norm at step {step}: {grad_norm}")
-
-            return loss.item()
-
+                
+            # Compute and return metrics
+            metrics = {
+                'loss': loss.item(),
+                'learning_rate': self.lr_scheduler.get_last_lr()[0],
+                'step': step,
+                'epoch': step / self.num_training_steps
+            }
+            
+            # Update progress bar
+            self.progress_bar.update(1)
+            self.progress_bar.set_postfix(**metrics)
+            
+            return metrics
+            
         except Exception as e:
-            ErrorHandler.handle_error(e, f"Training step {step}")
-            return None
+            ErrorHandler.handle_error(e, "_train_step")
+            raise
 
     def train(self):
         """
-        Train the model with mixed precision and gradient accumulation.
+        Execute the training loop with all optimizations.
+        
+        Returns:
+            dict: Final training metrics
         """
-        for epoch in range(self.num_train_epochs):
-            logger.info(f"Starting epoch {epoch}")
-
+        try:
+            logger.info("Starting optimized training loop")
             self.model.train()
-            for step, batch in enumerate(self.train_dataloader):
-                self._train_step(batch, step)
+            total_loss = 0
             
-            self.model.eval()
-            for step, batch in enumerate(self.eval_dataloader):
-                self._eval_step(batch, step)
-
-            self._compute_metrics()
-            self.save_and_upload(epoch)
-            logger.info(f"Completed epoch {epoch}")
+            # Enable memory optimizations
+            if self.specs.get('use_gradient_checkpointing', False):
+                logger.info("Enabling gradient checkpointing")
+                self.model.gradient_checkpointing_enable()
+                
+            # Main training loop
+            for step, batch in enumerate(self.train_dataloader):
+                # Training step with optimizations
+                metrics = self._train_step(batch, step)
+                total_loss += metrics['loss']
+                
+                # Evaluation if needed
+                if step > 0 and step % self.specs.get('eval_steps', 500) == 0:
+                    eval_metrics = self._eval_step(batch, step)
+                    metrics.update(eval_metrics)
+                    
+                # Save checkpoint if needed
+                if step > 0 and step % self.specs.get('save_steps', 500) == 0:
+                    self.save_model(step)
+                    
+            # Final evaluation
+            final_metrics = self._compute_metrics()
+            
+            # Clean up and return results
+            self.accelerator.free_memory()
+            return {
+                'train_loss': total_loss / len(self.train_dataloader),
+                **final_metrics
+            }
+            
+        except Exception as e:
+            ErrorHandler.handle_error(e, "train")
+            raise
 
     def _eval_step(self, batch, step):
         """
-        Perform a single evaluation step.
+        Execute a single evaluation step with optimizations.
         
         Args:
-            batch: The batch of data for the current step.
-            step: The current step number.
+            batch: The current batch of data
+            step: The current training step
+            
+        Returns:
+            dict: Evaluation metrics for this step
         """
-        with torch.no_grad():
-            outputs = self.model(**batch)
-            self.handle_outputs(outputs, batch, self.specs['per_device_eval_batch_size'], 
-                                self.losses, self.metric)
-        logger.info(f"Finished evaluating step {step}")
+        try:
+            self.model.eval()
+            metrics = {}
+            
+            with torch.no_grad():
+                # Forward pass with automatic mixed precision
+                with self.accelerator.autocast():
+                    outputs = self.model(**batch)
+                    
+                # Compute metrics
+                if self.metric is not None:
+                    metrics = self.handle_predictions_and_metric(outputs, batch, self.metric)
+                    
+            return metrics
+            
+        except Exception as e:
+            ErrorHandler.handle_error(e, "_eval_step")
+            raise
 
     def _compute_metrics(self):
         """
-        Compute and log metrics after evaluation.
+        Compute final metrics with optimizations.
+        
+        Returns:
+            dict: Computed metrics
         """
-        losses = torch.cat(self.losses)
-        losses = losses[: len(self.datasets['eval'])]
-        logger.info(f"Losses: {losses}")
-
-        if self.task_type == "question_answering":
-            self.start_logits = np.concatenate(self.start_logits)
-            self.end_logits = np.concatenate(self.end_logits)
-            self.compute_qna_metrics(self.start_logits, self.end_logits, self.eval_dataset, self.raw_dataset['eval'])
-        else:
-            self.metric.compute()
+        try:
+            self.model.eval()
+            all_preds = []
+            all_labels = []
+            
+            with torch.no_grad():
+                for batch in self.eval_dataloader:
+                    with self.accelerator.autocast():
+                        outputs = self.model(**batch)
+                        predictions = outputs.logits
+                        labels = batch['labels']
+                        
+                    # Gather predictions and labels from all processes
+                    predictions = self.accelerator.gather(predictions)
+                    labels = self.accelerator.gather(labels)
+                    
+                    all_preds.append(predictions)
+                    all_labels.append(labels)
+                    
+            # Concatenate all predictions and labels
+            all_preds = torch.cat(all_preds, dim=0)
+            all_labels = torch.cat(all_labels, dim=0)
+            
+            # Post-process predictions if needed
+            if hasattr(self, 'post_process_predictions'):
+                all_preds = self.post_process_predictions(all_preds)
+                
+            # Compute metrics
+            if self.metric is not None:
+                metrics = self.metric.compute(
+                    predictions=all_preds,
+                    references=all_labels
+                )
+                return metrics
+                
+            return {}
+            
+        except Exception as e:
+            ErrorHandler.handle_error(e, "_compute_metrics")
+            raise
 
     def print_args(self):
         print(self.specs)
