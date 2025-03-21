@@ -14,6 +14,21 @@ from configs.default_config import DEFAULT_SPECS
 from torch.utils.data import DataLoader
 import random
 from ..modules.trainer_customization import TrainerCustomizationMixin
+from .trainer_utils import (
+    PeftConfig,
+    check_is_peft_model,
+    prepare_scheduler,
+    calculate_training_steps,
+    configure_optimizer,
+    clip_gradients,
+    save_model_checkpoint,
+    get_default_metrics,
+    optimize_memory_settings,
+    setup_accelerate_integration
+)
+import logging
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class PeftConfig:
@@ -112,45 +127,13 @@ class NLPTrainer(pl.LightningModule, TrainerCustomizationMixin):
     2. Delegates device/precision handling to Accelerate
     3. Uses Accelerate's optimized memory management with Lightning's training flow
     4. Maintains compatibility with Accelerate's distributed features
-    
-    Attributes:
-        model: The model to be trained
-        tokenizer: The tokenizer for text processing
-        data_collator: The data collator for batching
-        train_dataset: The training dataset
-        eval_dataset: The evaluation dataset
-        task_type: The type of task being performed
-        losses: Storage for tracking losses
-        specs: Training specifications
-        optimizer: The optimizer for training
-        scheduler: Learning rate scheduler
-        is_peft_model: Whether this is a PEFT model
-        peft_config: Configuration for PEFT, if applicable
     """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
                 model_init=None, callbacks=None, scheduler=None, 
                 customization_config=None, **kwargs):
-        """
-        Initialize the NLPTrainer.
-        
-        Args:
-            args_dir (str): Directory containing configuration arguments
-            model: The model to be trained
-            tokenizer: The tokenizer for text processing
-            data_collator: The data collator for batching
-            train_dataset: The training dataset
-            eval_dataset: The evaluation dataset
-            task_type (str): The type of task (e.g., classification, generation)
-            optimizer: The optimizer for training (optional)
-            compute_metrics: Function to compute metrics during evaluation (optional)
-            model_init: Function to initialize the model (optional)
-            callbacks: List of callbacks to apply during training (optional)
-            scheduler: Learning rate scheduler (optional)
-            customization_config: Configuration for customization (optional)
-            **kwargs: Additional keyword arguments
-        """
+        """Initialize the NLPTrainer."""
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
@@ -169,8 +152,8 @@ class NLPTrainer(pl.LightningModule, TrainerCustomizationMixin):
         self.scheduler = scheduler
 
         # Add PEFT detection and configuration
-        self.is_peft_model = self._check_is_peft_model(model)
-        self.peft_config = self._get_peft_config() if self.is_peft_model else None
+        self.is_peft_model = check_is_peft_model(model)
+        self.peft_config = PeftConfig.from_pretrained(model) if self.is_peft_model else None
         
         # Initialize customization
         self.setup_customization(customization_config)
@@ -181,346 +164,49 @@ class NLPTrainer(pl.LightningModule, TrainerCustomizationMixin):
         
         # Initialize Accelerate if both Lightning and Accelerate are enabled
         if self.use_accelerate:
-            self._setup_accelerate_integration()
+            self.accelerator = setup_accelerate_integration(self.specs)
+            if self.accelerator:
+                # Save original device placement for Lightning
+                self._original_device = self.device
+                # Let Accelerate set the device
+                self.device = self.accelerator.device
 
-    def _setup_accelerate_integration(self):
-        """
-        Set up integration between Lightning and Accelerate.
-        
-        This method configures the trainer to work with both Lightning and
-        Accelerate simultaneously, leveraging the strengths of both frameworks.
-        """
-        try:
-            from accelerate import Accelerator
-            self.accelerator = Accelerator(
-                gradient_accumulation_steps=self.specs.get('gradient_accumulation_steps', 1),
-                mixed_precision=self.specs.get('fp16', True) and 'fp16' or 'no'
+        # Initialize metrics based on task type
+        self.metric = get_default_metrics(task_type)
+
+        # Optimize memory settings if needed
+        if self.is_peft_model:
+            optimize_memory_settings(
+                model=self.model,
+                use_gradient_checkpointing=self.specs.get('gradient_checkpointing', True)
             )
-            
-            # Save original device placement for Lightning
-            self._original_device = self.device
-            
-            # Let Accelerate set the device
-            self.device = self.accelerator.device
-            
-            print(f"Lightning-Accelerate integration: Using {self.device} with mixed precision: {self.accelerator.mixed_precision}")
-        except ImportError:
-            print("Accelerate not installed - falling back to Lightning-only mode")
-            self.use_accelerate = False
-
-    def _check_is_peft_model(self, model):
-        """
-        Check if the model is a PEFT model and get its type.
-        
-        Args:
-            model: The model to check
-            
-        Returns:
-            bool: Whether the model is a PEFT model
-        """
-        try:
-            from peft import PeftModel
-            is_peft = isinstance(model, PeftModel)
-            if is_peft:
-                peft_type = getattr(model.peft_config, "peft_type", "unknown")
-                print(f"Detected PEFT model of type: {peft_type}")
-                self._log_peft_params(model)
-            return is_peft
-        except ImportError:
-            print("PEFT not installed, continuing with standard training")
-            return False
-
-    def _log_peft_params(self, model):
-        """
-        Log PEFT-specific parameter information.
-        
-        Args:
-            model: The PEFT model to log information about
-        """
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"PEFT model has {trainable_params} trainable parameters out of {total_params} total parameters")
-        
-        if hasattr(model, "peft_config"):
-            config = model.peft_config
-            if hasattr(config, "r"):  # LoRA
-                print(f"LoRA rank: {config.r}")
-            elif hasattr(config, "num_virtual_tokens"):  # Prefix Tuning
-                print(f"Number of prefix tokens: {config.num_virtual_tokens}")
-
-    def _get_peft_config(self):
-        """
-        Get PEFT-specific configuration.
-        
-        Returns:
-            PeftConfig: The PEFT configuration object
-        """
-        if not self.is_peft_model:
-            return None
-            
-        peft_config = PeftConfig(
-            peft_type=getattr(self.model.peft_config, "peft_type", "unknown"),
-            task_type=self.task_type,
-            r=self.specs.get('lora_r', 8),
-            lora_alpha=self.specs.get('lora_alpha', 32),
-            lora_dropout=self.specs.get('lora_dropout', 0.1),
-        )
-        return peft_config
-
-    def forward(self, **inputs):
-        """
-        Forward pass through the model.
-        
-        Args:
-            **inputs: Input data for the model
-        
-        Returns:
-            Model outputs
-        """
-        return self.model(**inputs)
-
-    def training_step(self, batch, batch_idx):
-        """
-        Lightning training step with PEFT-aware gradient handling.
-        
-        Coordinates with Accelerate if both frameworks are enabled.
-        
-        Args:
-            batch: The batch of data for the current step
-            batch_idx: The index of the batch
-        
-        Returns:
-            Loss from the current training step
-        """
-        # Handle batch with Accelerate if enabled
-        if self.use_accelerate:
-            batch = self._prepare_accelerate_batch(batch)
-            
-        # Forward pass
-        outputs = self.forward(**batch)
-        loss = outputs.loss
-        
-        # Handle loss scaling based on PEFT type
-        if self.is_peft_model and hasattr(self.model, "peft_config"):
-            peft_type = self.model.peft_config.peft_type
-            if peft_type == "LORA":
-                # Scale based on LoRA alpha
-                loss = loss / getattr(self.model.peft_config, "lora_alpha", 32)
-            elif "PREFIX" in peft_type:
-                # Prefix tuning might need different scaling
-                loss = loss * 1.2
-        
-        # Apply gradient clipping if specified
-        if self.specs.get('max_grad_norm', 1.0) > 0 and self.is_peft_model:
-            self.clip_gradients()
-        
-        # Log metrics
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
-        
-        # Handle gradient accumulation if configured
-        if self.specs.get('gradient_accumulation_steps', 1) > 1:
-            loss = loss / self.specs.get('gradient_accumulation_steps')
-        
-        return loss
-
-    def _prepare_accelerate_batch(self, batch):
-        """
-        Prepare a batch for processing with Accelerate.
-        
-        Args:
-            batch: The input batch
-            
-        Returns:
-            The prepared batch
-        """
-        if not self.use_accelerate:
-            return batch
-            
-        # Move batch to Accelerate device if needed
-        if hasattr(self, 'accelerator'):
-            return {k: v.to(self.accelerator.device) for k, v in batch.items()}
-        return batch
-
-    def clip_gradients(self, parameters=None):
-        """
-        Apply PEFT-aware gradient clipping with Lightning integration.
-        
-        Args:
-            parameters: Optional list of parameters to clip. If None, uses all model parameters.
-        """
-        if not self.specs.get('max_grad_norm', 0) > 0:
-            return
-            
-        if parameters is None:
-            parameters = self.parameters()
-            
-        # Get PEFT-specific clipping configuration
-        if self.is_peft_model and hasattr(self.model, "peft_config"):
-            peft_type = self.model.peft_config.peft_type
-            if peft_type == "LORA":
-                # More aggressive clipping for LoRA to prevent instability
-                max_grad_norm = self.specs['max_grad_norm'] * 0.8
-                logger.info(f"Applying LoRA-specific gradient clipping with norm {max_grad_norm}")
-            elif "PREFIX" in peft_type:
-                # Less aggressive clipping for prefix tuning
-                max_grad_norm = self.specs['max_grad_norm'] * 1.2
-                logger.info(f"Applying Prefix-specific gradient clipping with norm {max_grad_norm}")
-            else:
-                max_grad_norm = self.specs['max_grad_norm']
-        else:
-            max_grad_norm = self.specs['max_grad_norm']
-            
-        # Apply clipping using Lightning's built-in method if available
-        if hasattr(self, 'trainer') and self.trainer is not None:
-            self.trainer.gradient_clip_val = max_grad_norm
-            self.trainer.gradient_clip_algorithm = 'norm'
-        else:
-            # Fallback to PyTorch implementation
-            torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
-        
-        if self.specs.get('debug_gradients', False):
-            # Log gradient norms for debugging
-            grad_norm = torch.norm(torch.stack([
-                torch.norm(p.grad.detach()) 
-                for p in parameters 
-                if p.grad is not None
-            ]))
-            self.log('gradient_norm', grad_norm, prog_bar=True)
-
-    def on_before_optimizer_step(self, optimizer):
-        """
-        Handle gradient operations before optimizer step.
-        
-        Args:
-            optimizer: The optimizer being used.
-        """
-        if not self.is_peft_model:
-            return
-
-        # Check for NaN or Inf gradients
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                valid_gradients = not (torch.isnan(param.grad).any() or torch.isinf(param.grad).any())
-                if not valid_gradients:
-                    print(f"Warning: Invalid gradients detected in {name}")
-                    param.grad.data = torch.zeros_like(param.grad.data)
-
-        # Gradient scaling for different PEFT types
-        if hasattr(self.model, "peft_config"):
-            peft_type = self.model.peft_config.peft_type
-            if peft_type == "LORA":
-                self._scale_lora_gradients()
-            elif "PREFIX" in peft_type:
-                self._scale_prefix_gradients()
-
-    def _scale_lora_gradients(self):
-        """Scale gradients specifically for LoRA parameters."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                # Scale LoRA gradients
-                if 'lora_' in name:
-                    if param.grad is not None:
-                        param.grad.data = param.grad.data / self.model.peft_config.lora_alpha
-
-    def _scale_prefix_gradients(self):
-        """Scale gradients specifically for prefix tuning parameters."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                # Scale prefix tuning gradients
-                if 'prefix' in name:
-                    if param.grad is not None:
-                        # Apply more conservative updates to prefix parameters
-                        param.grad.data = param.grad.data * 0.8
-
-    def validation_step(self, batch, batch_idx):
-        """
-        Perform a single validation step.
-        
-        Args:
-            batch: The batch of data for the current step.
-            batch_idx: The index of the batch.
-        
-        Returns:
-            Validation loss.
-        """
-        outputs = self.forward(**batch)
-        val_loss = outputs.loss
-        self.log('val_loss', val_loss)
-        return val_loss
-
-    def prepare_scheduler(self, optimizer):
-        """Prepare learning rate scheduler with proper configuration."""
-        num_training_steps = self.calculate_training_steps()
-        
-        # Get scheduler type and warmup ratio from specs
-        scheduler_type = self.specs.get('scheduler_type', 'linear')
-        warmup_ratio = self.specs.get('warmup_ratio', 0.1)
-        num_warmup_steps = int(num_training_steps * warmup_ratio)
-        
-        if scheduler_type == 'linear':
-            from transformers import get_linear_schedule_with_warmup
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps
-            )
-        elif scheduler_type == 'cosine':
-            from transformers import get_cosine_schedule_with_warmup
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps
-            )
-        elif scheduler_type == 'one_cycle':
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=self.specs.get('learning_rate', 2e-5),
-                total_steps=num_training_steps,
-                pct_start=warmup_ratio
-            )
-        else:
-            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
-            
-        Logger.info(f"Created {scheduler_type} scheduler with {num_warmup_steps} warmup steps")
-        return scheduler
-
-    def calculate_training_steps(self):
-        """Calculate total training steps."""
-        train_dataset_size = len(self.train_dataset)
-        batch_size = self.specs.get('per_device_train_batch_size', 8)
-        grad_accumulation = self.specs.get('gradient_accumulation_steps', 1)
-        num_epochs = self.specs.get('num_train_epochs', 3)
-        
-        # Account for distributed training if using Lightning
-        if hasattr(self, 'trainer') and self.trainer is not None:
-            num_devices = self.trainer.num_devices
-            batch_size *= num_devices
-            
-        steps_per_epoch = train_dataset_size // (batch_size * grad_accumulation)
-        total_steps = steps_per_epoch * num_epochs
-        
-        return total_steps
 
     def configure_optimizers(self):
-        """Configure and return the optimizer with proper parameter handling."""
-        # Get trainable parameters based on PEFT status
-        if self.is_peft_model:
-            params = [p for p in self.parameters() if p.requires_grad]
-            logger.info(f"Configuring optimizer for PEFT model with {len(params)} trainable parameters")
-        else:
-            params = self.parameters()
-            logger.info("Configuring optimizer for full model")
-
-        # Create optimizer with specified or default parameters
-        optimizer = torch.optim.AdamW(
-            params,
-            lr=self.specs.get('learning_rate', 2e-5),
-            weight_decay=self.specs.get('weight_decay', 0.01),
+        """Configure optimizers and schedulers."""
+        # Configure optimizer
+        optimizer = configure_optimizer(
+            model=self.model,
+            is_peft_model=self.is_peft_model,
+            learning_rate=self.specs.get('learning_rate', 2e-5),
+            weight_decay=self.specs.get('weight_decay', 0.01)
         )
         
         # Configure scheduler if specified
         if self.specs.get('use_lr_scheduler', False):
-            scheduler = self.prepare_scheduler(optimizer)
+            num_training_steps = calculate_training_steps(
+                train_dataset_size=len(self.train_dataset),
+                batch_size=self.specs.get('per_device_train_batch_size', 8),
+                grad_accumulation=self.specs.get('gradient_accumulation_steps', 1),
+                num_epochs=self.specs.get('num_train_epochs', 3)
+            )
+            
+            scheduler = prepare_scheduler(
+                optimizer=optimizer,
+                num_training_steps=num_training_steps,
+                scheduler_type=self.specs.get('scheduler_type', 'linear'),
+                warmup_ratio=self.specs.get('warmup_ratio', 0.1)
+            )
+            
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
@@ -532,463 +218,152 @@ class NLPTrainer(pl.LightningModule, TrainerCustomizationMixin):
         
         return optimizer
 
-    def on_fit_start(self):
-        """Enhanced training setup with optimized memory handling for PEFT models."""
-        super().on_fit_start()
+    def training_step(self, batch, batch_idx):
+        """Perform a training step."""
+        outputs = self.model(**batch)
+        loss = outputs.loss
         
+        # Handle gradients for PEFT models
         if self.is_peft_model:
-            # Get PEFT configuration
-            peft_config = self.peft_config or PeftConfig.from_pretrained(self.model)
-            
-            # Enable gradient checkpointing if specified
-            if peft_config.use_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
-                self.model.gradient_checkpointing_enable()
-                print("Enabled gradient checkpointing for PEFT model")
-            
-            # Disable model caching if specified
-            if not peft_config.use_cache and hasattr(self.model, "config"):
-                self.model.config.use_cache = False
-                print("Disabled model caching for memory efficiency")
-            
-            # Handle quantization settings
-            if peft_config.quantization_type:
-                try:
-                    from transformers import BitsAndBytesConfig
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=peft_config.quantization_type == "4bit",
-                        load_in_8bit=peft_config.quantization_type == "8bit",
-                        bnb_4bit_compute_dtype=torch.float16
-                    )
-                    print(f"Applied {peft_config.quantization_type} quantization")
-                except ImportError:
-                    print("BitsAndBytes not available for quantization")
-            
-            # Adjust batch size based on PEFT type
-            if hasattr(self.model, "peft_config"):
-                peft_type = self.model.peft_config.peft_type
-                if peft_type == "LORA":
-                    self.trainer.accumulate_grad_batches = max(1, self.trainer.accumulate_grad_batches // 2)
-                elif "PREFIX" in peft_type:
-                    self.trainer.accumulate_grad_batches = self.trainer.accumulate_grad_batches * 2
-                print(f"Adjusted gradient accumulation for {peft_type}: {self.trainer.accumulate_grad_batches} steps")
-
-    def on_save_checkpoint(self, checkpoint):
-        """Enhanced checkpoint saving with comprehensive PEFT state management."""
-        checkpoint = super().on_save_checkpoint(checkpoint)
+            clip_gradients(
+                model=self.model,
+                max_grad_norm=self.specs.get('max_grad_norm', 1.0),
+                is_peft_model=True
+            )
         
-        if self.is_peft_model:
-            try:
-                # Save PEFT adapter state
-                checkpoint['peft_adapter_state'] = self.model.get_adapter_state_dict()
-                
-                # Save PEFT configuration
-                if hasattr(self.model, "peft_config"):
-                    checkpoint['peft_config'] = self.model.peft_config
-                    checkpoint['peft_type'] = self.model.peft_config.peft_type
-                
-                # Save quantization state if applicable
-                if hasattr(self.model, "quantization_config"):
-                    checkpoint['quantization_config'] = self.model.quantization_config
-                
-                # Save additional training state
-                checkpoint['peft_training_state'] = {
-                    'current_lora_alpha': getattr(self.model.peft_config, "lora_alpha", None),
-                    'current_r': getattr(self.model.peft_config, "r", None),
-                    'trainable_params': sum(p.numel() for p in self.model.parameters() if p.requires_grad),
-                    'total_params': sum(p.numel() for p in self.model.parameters())
-                }
-                
-                print("Saved complete PEFT state to checkpoint")
-            except Exception as e:
-                print(f"Error saving PEFT state: {str(e)}")
-        
-        return checkpoint
-    
-    def on_load_checkpoint(self, checkpoint):
-        """Enhanced checkpoint loading with comprehensive PEFT state restoration."""
-        super().on_load_checkpoint(checkpoint)
-        
-        if self.is_peft_model:
-            try:
-                # Restore PEFT adapter state
-                if 'peft_adapter_state' in checkpoint:
-                    self.model.load_adapter_state_dict(checkpoint['peft_adapter_state'])
-                    print("Restored PEFT adapter state")
-                
-                # Restore PEFT configuration
-                if 'peft_config' in checkpoint:
-                    self.model.peft_config = checkpoint['peft_config']
-                    print(f"Restored PEFT configuration for type: {checkpoint.get('peft_type', 'unknown')}")
-                
-                # Restore quantization configuration
-                if 'quantization_config' in checkpoint and hasattr(self.model, "quantization_config"):
-                    self.model.quantization_config = checkpoint['quantization_config']
-                    print("Restored quantization configuration")
-                
-                # Verify training state
-                if 'peft_training_state' in checkpoint:
-                    current_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-                    saved_trainable = checkpoint['peft_training_state']['trainable_params']
-                    if current_trainable != saved_trainable:
-                        print(f"Warning: Current trainable parameters ({current_trainable}) "
-                              f"differ from checkpoint ({saved_trainable})")
-                
-                print("Completed PEFT state restoration")
-            except Exception as e:
-                print(f"Error loading PEFT state: {str(e)}")
+        self.log('train_loss', loss, prog_bar=True)
+        return loss
 
-    def print_args(self):
-        """
-        Print the training arguments.
-        """
-        print(self.specs)
-
-    def print_trainer_type(self):
-        """
-        Print the type of trainer.
-        """
-        print("I am an NLPTrainer!")
-
-    def train(self, max_epochs=10, gpus=1):
-        """
-        Train the model using PyTorch Lightning's Trainer.
+    def validation_step(self, batch, batch_idx):
+        """Perform a validation step."""
+        outputs = self.model(**batch)
+        loss = outputs.loss
         
-        Args:
-            max_epochs (int): Maximum number of epochs to train.
-            gpus (int): Number of GPUs to use for training.
-        """
-        trainer = pl.Trainer(max_epochs=max_epochs, gpus=gpus)
-        trainer.fit(self, self.train_dataloader(), self.val_dataloader())
+        self.log('val_loss', loss, prog_bar=True)
+        return loss
+
+    def save_checkpoint(self, filepath):
+        """Save model checkpoint."""
+        return save_model_checkpoint(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            output_dir=filepath,
+            is_peft_model=self.is_peft_model
+        )
 
     def train_dataloader(self):
-        """
-        Create the training data loader.
-        
-        Returns:
-            DataLoader: The training data loader.
-        """
-        return DataLoader(self.train_dataset, batch_size=self.specs['per_device_train_batch_size'], collate_fn=self.data_collator)
+        """Get train dataloader."""
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.specs.get('per_device_train_batch_size', 8),
+            shuffle=True,
+            collate_fn=self.data_collator,
+            num_workers=self.specs.get('dataloader_num_workers', 0)
+        )
 
     def val_dataloader(self):
-        """
-        Create the validation data loader.
-        
-        Returns:
-            DataLoader: The validation data loader.
-        """
-        return DataLoader(self.eval_dataset, batch_size=self.specs['per_device_eval_batch_size'], collate_fn=self.data_collator)
+        """Get validation dataloader."""
+        if self.eval_dataset is None:
+            return None
+            
+        return DataLoader(
+            self.eval_dataset,
+            batch_size=self.specs.get('per_device_eval_batch_size', 8),
+            collate_fn=self.data_collator,
+            num_workers=self.specs.get('dataloader_num_workers', 0)
+        )
 
 class NLPSeq2SeqTrainer(NLPTrainer):
     """
     A PyTorch Lightning trainer class for sequence-to-sequence NLP models.
     
-    Attributes:
-        model: The model to be trained.
-        specs: Configuration specifications for training.
-        task_type: The type of task (e.g., translation, summarization).
-        losses: A list to store training losses.
+    This trainer extends NLPTrainer to handle sequence-to-sequence tasks like translation,
+    summarization, and text generation. It includes specialized handling for generation
+    configuration and sequence-specific metrics.
     """
     def __init__(self, args_dir, model, tokenizer, 
                 data_collator, train_dataset, eval_dataset, 
                 task_type, optimizer=None, compute_metrics=None,
-                model_init=None, callbacks=None, scheduler=None, 
+                model_init=None, callbacks=None, scheduler=None,
                 generation_config=None, customization_config=None, **kwargs):
-        """
-        Initialize the NLPSeq2SeqTrainer.
-        """
-        super().__init__(args_dir, model, tokenizer, 
-                        data_collator, train_dataset, eval_dataset, 
-                        task_type, optimizer, compute_metrics,
-                        model_init, callbacks, scheduler, 
-                        customization_config, **kwargs)
+        """Initialize the NLPSeq2SeqTrainer."""
+        super().__init__(args_dir, model, tokenizer, data_collator, 
+                        train_dataset, eval_dataset, task_type, 
+                        optimizer, compute_metrics, model_init, 
+                        callbacks, scheduler, customization_config, **kwargs)
                         
-        # Setup specialized configuration for seq2seq training
-        self.setup_seq2seq_config()
-        
-        # Initialize metric tracking
-        self.compute_metrics = compute_metrics
-        self.current_val_metrics = {}
-
-    def setup_seq2seq_config(self):
-        """Setup specialized configuration for seq2seq training"""
-        self.teacher_forcing_ratio = self.specs.get('teacher_forcing_ratio', 0.5)
-        self.use_selective_activation_cache = self.specs.get('use_selective_activation_cache', True)
-        
-        # Setup generation config with memory optimization
-        self.generation_config = GenerationConfig(
+        # Store generation config
+        self.generation_config = generation_config or GenerationConfig(
             max_length=self.specs.get('max_length', 128),
             num_beams=self.specs.get('num_beams', 4),
             length_penalty=self.specs.get('length_penalty', 1.0),
-            early_stopping=True,
-            use_cache=not self.is_peft_model,  # Disable KV cache for PEFT models
+            early_stopping=self.specs.get('early_stopping', True)
         )
-
-    def _prepare_inputs(self, batch):
-        """Enhanced input preparation with specialized attention patterns"""
-        inputs = super()._prepare_inputs(batch)
         
-        # Handle attention masks differently for encoder and decoder
-        if 'attention_mask' in inputs:
-            encoder_attention_mask = inputs['attention_mask']
-            # Create causal mask for decoder
-            decoder_attention_mask = self._create_causal_mask(
-                inputs.get('decoder_input_ids', None)
+        # Initialize sequence-specific metrics
+        self.seq_metrics = get_default_metrics(task_type, is_seq2seq=True)
+        
+        # Optimize memory settings for sequence models
+        if self.is_peft_model:
+            optimize_memory_settings(
+                model=self.model,
+                use_gradient_checkpointing=self.specs.get('gradient_checkpointing', True),
+                is_seq2seq=True
             )
-            
-            inputs['encoder_attention_mask'] = encoder_attention_mask
-            inputs['decoder_attention_mask'] = decoder_attention_mask
-            
-        return inputs
-
-    def _create_causal_mask(self, input_ids):
-        """Create causal attention mask for decoder"""
-        if input_ids is None:
-            return None
-            
-        batch_size, seq_length = input_ids.shape
-        mask = torch.triu(
-            torch.ones((seq_length, seq_length), dtype=torch.bool, device=self.device),
-            diagonal=1
-        )
-        mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
-        return mask
-
-    def _setup_gradient_checkpointing(self):
-        """Enhanced gradient checkpointing for seq2seq models"""
-        if not self.specs.get('use_gradient_checkpointing', False):
-            return
-            
-        # Enable gradient checkpointing
-        if hasattr(self.model, 'encoder'):
-            self.model.encoder.gradient_checkpointing_enable()
-        if hasattr(self.model, 'decoder'):
-            self.model.decoder.gradient_checkpointing_enable()
-        
-        # Selective activation caching
-        if self.use_selective_activation_cache:
-            if hasattr(self.model.encoder, "enable_selective_activation_cache"):
-                self.model.encoder.enable_selective_activation_cache()
-            if hasattr(self.model.decoder, "enable_selective_activation_cache"):
-                self.model.decoder.enable_selective_activation_cache()
-
-    def _optimize_beam_search(self):
-        """Memory-efficient beam search implementation"""
-        kwargs = {}
-        
-        if not self.is_peft_model:
-            return kwargs
-            
-        # Optimize memory usage for PEFT models during beam search
-        kwargs['use_cache'] = False  # Disable KV cache
-        
-        # Adjust beam size based on available memory
-        if self.specs.get('num_beams', 4) > 4 and torch.cuda.is_available():
-            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-            if free_memory < 4 * 1024 * 1024 * 1024:  # Less than 4GB free
-                kwargs['num_beams'] = min(self.specs.get('num_beams', 4), 4)
-                
-        return kwargs
 
     def training_step(self, batch, batch_idx):
-        """
-        Enhanced training step with specialized seq2seq handling and loss computation.
-        
-        Args:
-            batch: The batch of data for the current step
-            batch_idx: The index of the batch
-            
-        Returns:
-            Loss from the current training step
-        """
-        # Setup gradient checkpointing
-        self._setup_gradient_checkpointing()
-        
-        # Prepare inputs with attention patterns
-        inputs = self._prepare_inputs(batch)
-        
-        # Forward pass with teacher forcing
-        if random.random() < self.teacher_forcing_ratio:
-            outputs = self.model(**inputs)
-        else:
-            with torch.no_grad():
-                generated = self.model.generate(
-                    inputs['input_ids'],
-                    attention_mask=inputs.get('attention_mask'),
-                    **self._optimize_beam_search()
-                )
-            outputs = self.model(**inputs, decoder_input_ids=generated)
-        
+        """Perform a training step with sequence-specific loss handling."""
+        outputs = self.model(**batch)
         loss = outputs.loss
         
-        # Handle loss scaling based on PEFT type
-        if self.is_peft_model and hasattr(self.model, "peft_config"):
-            peft_type = self.model.peft_config.peft_type
-            if peft_type == "LORA":
-                # Different scaling for Seq2Seq LoRA
-                loss = loss / (getattr(self.model.peft_config, "lora_alpha", 32) * 1.2)
-            elif "PREFIX" in peft_type:
-                # Different scaling for Seq2Seq prefix tuning
-                loss = loss * 1.1
+        # Handle gradients for PEFT models with sequence-specific settings
+        if self.is_peft_model:
+            clip_gradients(
+                model=self.model,
+                max_grad_norm=self.specs.get('max_grad_norm', 1.0),
+                is_peft_model=True,
+                is_seq2seq=True
+            )
         
-        # Handle gradient accumulation
-        if self.specs.get('gradient_accumulation_steps', 1) > 1:
-            loss = loss / self.specs.get('gradient_accumulation_steps')
-        
-        # Log metrics
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
-        
-        if self.specs.get('debug_gradients', False):
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in trainable_params if p.grad is not None]))
-            self.log('gradient_norm', grad_norm, prog_bar=True)
-        
+        self.log('train_loss', loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Enhanced validation step with memory optimizations"""
-        inputs = self._prepare_inputs(batch)
+        """Perform a validation step with sequence generation."""
+        # Standard loss calculation
+        outputs = self.model(**batch)
+        val_loss = outputs.loss
+        self.log('val_loss', val_loss, prog_bar=True)
         
-        generation_kwargs = self._optimize_beam_search()
-        
-        # Generate with optimized memory usage
-        with torch.no_grad():
-            generated_tokens = self.model.generate(
-                inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                **generation_kwargs,
+        # Generate sequences for evaluation
+        if self.generation_config:
+            generated_ids = self.model.generate(
+                batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                **self.generation_config.to_dict()
             )
             
-        # Compute loss
-        outputs = self.model(**inputs)
-        loss = outputs.loss
+            # Decode generated and target sequences
+            generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            target_texts = self.tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+            
+            # Calculate sequence-specific metrics
+            if self.seq_metrics:
+                for metric_name, metric_fn in self.seq_metrics.items():
+                    score = metric_fn(predictions=generated_texts, references=target_texts)
+                    self.log(f'val_{metric_name}', score, prog_bar=True)
         
-        # Log metrics
-        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
-        
-        return {
-            'val_loss': loss,
-            'generated': generated_tokens,
-            'labels': inputs.get('labels')
-        }
+        return val_loss
 
-    def validation_epoch_end(self, outputs):
-        """Process all validation outputs at the end of the epoch"""
-        all_predictions = []
-        all_labels = []
-        total_loss = 0.0
-        
-        # Gather predictions and labels
-        for output in outputs:
-            all_predictions.extend(output['predictions'])
-            # Decode labels if they're token IDs
-            if isinstance(output['labels'], torch.Tensor):
-                labels = self.tokenizer.batch_decode(output['labels'], skip_special_tokens=True)
-            else:
-                labels = output['labels']
-            all_labels.extend(labels)
-            total_loss += output['loss'].item()
-            
-        # Compute average loss
-        avg_loss = total_loss / len(outputs)
-        self.log('val_loss', avg_loss, prog_bar=True)
-        
-        # Compute sequence metrics
-        metrics = self.compute_seq2seq_metrics(all_predictions, all_labels)
-        self.current_val_metrics = metrics
-        
-        # Log all metrics
-        for metric_name, value in metrics.items():
-            self.log(f'val_{metric_name}', value, prog_bar=True)
-            
-        return {'val_loss': avg_loss, **metrics}
-
-    def compute_seq2seq_metrics(self, predictions, labels):
-        """Compute sequence-to-sequence specific metrics"""
-        metrics = {}
-        
-        # Use provided compute_metrics function if available
-        if self.compute_metrics is not None:
-            metrics.update(self.compute_metrics(predictions, labels))
-            
-        # Add task-specific metrics
-        if self.task_type == "translation":
-            try:
-                import sacrebleu
-                bleu = sacrebleu.corpus_bleu(predictions, [labels])
-                metrics['bleu'] = bleu.score
-            except ImportError:
-                print("sacrebleu not installed, skipping BLEU score computation")
-                
-        elif self.task_type == "summarization":
-            try:
-                rouge = evaluate.load('rouge')
-                rouge_output = rouge.compute(predictions=predictions, references=labels)
-                metrics.update(rouge_output)
-            except Exception as e:
-                print(f"Error computing ROUGE score: {e}")
-                
-        return metrics
-
-    def postprocess_text(self, preds, labels):
-        """Post-process generated text and labels"""
-        preds = [pred.strip() for pred in preds]
-        labels = [label.strip() for label in labels]
-        
-        # Remove special tokens if any remain
-        special_tokens = set([self.tokenizer.pad_token, self.tokenizer.eos_token, 
-                            self.tokenizer.bos_token, self.tokenizer.sep_token, 
-                            self.tokenizer.cls_token])
-        special_tokens = {t for t in special_tokens if t is not None}
-        
-        for token in special_tokens:
-            preds = [pred.replace(token, '') for pred in preds]
-            labels = [label.replace(token, '') for label in labels]
-            
-        # Clean up whitespace
-        preds = [" ".join(pred.split()) for pred in preds]
-        labels = [" ".join(label.split()) for label in labels]
-        
-        return preds, labels
-
-    def on_save_checkpoint(self, checkpoint):
-        """Enhanced checkpoint saving with seq2seq state management"""
-        super().on_save_checkpoint(checkpoint)
-        
-        if self.is_peft_model:
-            # Save encoder and decoder states separately
-            if hasattr(self.model, 'encoder'):
-                checkpoint['encoder_state'] = self.model.encoder.state_dict()
-            if hasattr(self.model, 'decoder'):
-                checkpoint['decoder_state'] = self.model.decoder.state_dict()
-            
-            # Save generation config
-            checkpoint['generation_config'] = self.generation_config.to_dict()
-            
-            # Save memory optimization settings
-            checkpoint['memory_config'] = {
-                'use_selective_activation_cache': self.use_selective_activation_cache,
-                'teacher_forcing_ratio': self.teacher_forcing_ratio
-            }
-
-    def on_load_checkpoint(self, checkpoint):
-        """Enhanced checkpoint loading with seq2seq state management"""
-        super().on_load_checkpoint(checkpoint)
-        
-        if self.is_peft_model:
-            # Load encoder and decoder states
-            if 'encoder_state' in checkpoint and hasattr(self.model, 'encoder'):
-                self.model.encoder.load_state_dict(checkpoint['encoder_state'])
-            if 'decoder_state' in checkpoint and hasattr(self.model, 'decoder'):
-                self.model.decoder.load_state_dict(checkpoint['decoder_state'])
-            
-            # Load generation config
-            if 'generation_config' in checkpoint:
-                self.generation_config = GenerationConfig(**checkpoint['generation_config'])
-            
-            # Load memory optimization settings
-            if 'memory_config' in checkpoint:
-                self.use_selective_activation_cache = checkpoint['memory_config']['use_selective_activation_cache']
-                self.teacher_forcing_ratio = checkpoint['memory_config']['teacher_forcing_ratio']
+    def save_checkpoint(self, filepath):
+        """Save model checkpoint with sequence-specific configurations."""
+        save_model_checkpoint(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            output_dir=filepath,
+            is_peft_model=self.is_peft_model,
+            generation_config=self.generation_config
+        )
 
     def print_args(self):
         """

@@ -15,6 +15,16 @@ import numpy as np
 import nltk
 from mlflow_callback import MLflowCallback
 from ..modules.trainer_customization import TrainerCustomizationMixin
+from .trainer_utils import (
+    check_is_peft_model,
+    prepare_scheduler,
+    calculate_training_steps,
+    configure_optimizer,
+    clip_gradients,
+    save_model_checkpoint,
+    get_default_metrics,
+    optimize_memory_settings
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +59,10 @@ class NLPTrainer(Trainer, TrainerCustomizationMixin):
         self.task_type = task_type
         self.losses = []
         self.tokenizer = tokenizer
+        self.model = model
 
         # Check if this is a PEFT model before initializing
-        self.is_peft_model = self._check_is_peft_model(model)
+        self.is_peft_model = check_is_peft_model(model)
         
         # Initialize customization
         self.setup_customization(customization_config)
@@ -66,13 +77,7 @@ class NLPTrainer(Trainer, TrainerCustomizationMixin):
             scheduler = None
             
         # Initialize metrics based on task type
-        self.metric = None
-        if task_type in ["classification", "token-classification"]:
-            self.metric = evaluate.load("accuracy")
-        elif task_type in ["summarization", "translation"]:
-            self.metric = evaluate.load("rouge")
-        elif task_type == "question-answering":
-            self.metric = evaluate.load("squad")
+        self.metric = get_default_metrics(task_type)
             
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
@@ -90,77 +95,29 @@ class NLPTrainer(Trainer, TrainerCustomizationMixin):
                         compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
 
-    def _check_is_peft_model(self, model):
-        """Check if the model is a PEFT model"""
-        try:
-            from peft import PeftModel
-            is_peft = isinstance(model, PeftModel)
-            if is_peft:
-                logger.info(f"Detected PEFT model: {type(model).__name__}")
-                # Log trainable parameters for PEFT model
-                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                logger.info(f"Number of trainable parameters: {trainable_params}")
-            return is_peft
-        except ImportError:
-            logger.info("PEFT not installed, continuing with standard training")
-            return False
-
     def prepare_scheduler(self, optimizer):
         """Prepare learning rate scheduler with proper configuration."""
-        num_training_steps = self.calculate_training_steps()
+        num_training_steps = calculate_training_steps(
+            train_dataset_size=len(self.train_dataset),
+            batch_size=self.specs.get('per_device_train_batch_size', 8),
+            grad_accumulation=self.specs.get('gradient_accumulation_steps', 1),
+            num_epochs=self.specs.get('num_train_epochs', 3)
+        )
         
-        # Get scheduler type and warmup ratio from specs
-        scheduler_type = self.specs.get('scheduler_type', 'linear')
-        warmup_ratio = self.specs.get('warmup_ratio', 0.1)
-        num_warmup_steps = int(num_training_steps * warmup_ratio)
-        
-        if scheduler_type == 'linear':
-            from transformers import get_linear_schedule_with_warmup
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps
-            )
-        elif scheduler_type == 'cosine':
-            from transformers import get_cosine_schedule_with_warmup
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps
-            )
-        else:
-            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
-            
-        logger.info(f"Created {scheduler_type} scheduler with {num_warmup_steps} warmup steps")
-        return scheduler
-
-    def calculate_training_steps(self):
-        """Calculate total training steps."""
-        train_dataset_size = len(self.train_dataset)
-        batch_size = self.specs.get('per_device_train_batch_size', 8)
-        grad_accumulation = self.specs.get('gradient_accumulation_steps', 1)
-        num_epochs = self.specs.get('num_train_epochs', 3)
-        
-        steps_per_epoch = train_dataset_size // (batch_size * grad_accumulation)
-        total_steps = steps_per_epoch * num_epochs
-        
-        return total_steps
+        return prepare_scheduler(
+            optimizer=optimizer,
+            num_training_steps=num_training_steps,
+            scheduler_type=self.specs.get('scheduler_type', 'linear'),
+            warmup_ratio=self.specs.get('warmup_ratio', 0.1)
+        )
 
     def configure_optimizers(self):
         """Configure and return the optimizer with proper parameter handling."""
-        # Get trainable parameters based on PEFT status
-        if self.is_peft_model:
-            params = [p for p in self.model.parameters() if p.requires_grad]
-            logger.info(f"Configuring optimizer for PEFT model with {len(params)} trainable parameters")
-        else:
-            params = self.model.parameters()
-            logger.info("Configuring optimizer for full model")
-
-        # Create optimizer with specified or default parameters
-        optimizer = torch.optim.AdamW(
-            params,
-            lr=self.specs.get('learning_rate', 2e-5),
-            weight_decay=self.specs.get('weight_decay', 0.01),
+        optimizer = configure_optimizer(
+            model=self.model,
+            is_peft_model=self.is_peft_model,
+            learning_rate=self.specs.get('learning_rate', 2e-5),
+            weight_decay=self.specs.get('weight_decay', 0.01)
         )
         
         # Configure scheduler if specified
@@ -188,9 +145,10 @@ class NLPTrainer(Trainer, TrainerCustomizationMixin):
                     logger.info(f"PEFT config: {peft_config}")
                     
                     # Add PEFT-specific memory optimizations
-                    if getattr(self.args, "gradient_checkpointing", False):
-                        logger.info("Enabling gradient checkpointing for PEFT model")
-                        self.model.gradient_checkpointing_enable()
+                    optimize_memory_settings(
+                        model=self.model,
+                        use_gradient_checkpointing=getattr(self.args, "gradient_checkpointing", False)
+                    )
                         
             except Exception as e:
                 logger.warning(f"Error configuring PEFT model: {e}")
@@ -201,21 +159,14 @@ class NLPTrainer(Trainer, TrainerCustomizationMixin):
         """Save model with special handling for PEFT models"""
         output_dir = output_dir if output_dir is not None else self.args.output_dir
 
-        # Special handling for PEFT models
+        # Use centralized save function for PEFT models
         if self.is_peft_model:
-            try:
-                logger.info(f"Saving PEFT adapter to {output_dir}")
-                # Save only the adapter parameters
-                self.model.save_pretrained(output_dir)
-                
-                # Also save the tokenizer
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(output_dir)
-                    
-                return output_dir
-            except Exception as e:
-                logger.error(f"Error saving PEFT model: {e}")
-                # Fall back to standard save
+            return save_model_checkpoint(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                output_dir=output_dir,
+                is_peft_model=True
+            )
         
         # Standard save for non-PEFT models
         return super().save_model(output_dir, _internal_call)
@@ -244,35 +195,14 @@ class NLPTrainer(Trainer, TrainerCustomizationMixin):
 
     def _handle_gradients(self, loss):
         """Handle gradients with PEFT-specific optimizations"""
-        if not self.is_peft_model:
-            return loss
-
-        # Scale loss based on PEFT type
-        if hasattr(self.model, "peft_config"):
-            peft_type = self.model.peft_config.peft_type
-            if peft_type == "LORA":
-                # Scale based on LoRA alpha
-                loss = loss / getattr(self.model.peft_config, "lora_alpha", 32)
-            elif "PREFIX" in peft_type:
-                # Prefix tuning might need different scaling
-                loss = loss * 1.2
-
-        # Apply gradient clipping
-        if self.specs.get('max_grad_norm', 0) > 0:
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            if hasattr(self.model, "peft_config"):
-                peft_type = self.model.peft_config.peft_type
-                if peft_type == "LORA":
-                    # More aggressive clipping for LoRA
-                    max_grad_norm = self.specs['max_grad_norm'] * 0.8
-                elif "PREFIX" in peft_type:
-                    # More conservative clipping for prefix tuning
-                    max_grad_norm = self.specs['max_grad_norm'] * 1.2
-                else:
-                    max_grad_norm = self.specs['max_grad_norm']
-                    
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
-
+        if self.is_peft_model:
+            # Use centralized gradient clipping for PEFT models
+            clip_gradients(
+                model=self.model,
+                max_grad_norm=self.args.max_grad_norm,
+                is_peft_model=True
+            )
+        
         return loss
 
     def _scale_gradients(self):
@@ -503,7 +433,7 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer, TrainerCustomizationMixin):
         self.generation_config = generation_config
 
         # Check if this is a PEFT model before initializing
-        self.is_peft_model = self._check_is_peft_model(model)
+        self.is_peft_model = check_is_peft_model(model)
         
         # Initialize customization
         self.setup_customization(customization_config)
@@ -518,11 +448,7 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer, TrainerCustomizationMixin):
             scheduler = None
         
         # Initialize metrics based on task type
-        self.metric = None
-        if task_type in ["summarization", "translation"]:
-            self.metric = evaluate.load("rouge")
-        elif task_type == "question-answering":
-            self.metric = evaluate.load("squad")
+        self.metric = get_default_metrics(task_type)
             
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
@@ -547,21 +473,6 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer, TrainerCustomizationMixin):
                         model_init=model_init, 
                         compute_metrics=compute_metrics or self.compute_metrics,
                         callbacks=callbacks, **kwargs)
-
-    def _check_is_peft_model(self, model):
-        """Check if the model is a PEFT model"""
-        try:
-            from peft import PeftModel
-            is_peft = isinstance(model, PeftModel)
-            if is_peft:
-                logger.info(f"Detected PEFT model: {type(model).__name__}")
-                # Log trainable parameters for PEFT model
-                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                logger.info(f"Number of trainable parameters: {trainable_params}")
-            return is_peft
-        except ImportError:
-            logger.info("PEFT not installed, continuing with standard training")
-            return False
 
     def configure_optimizers(self):
         """Configure and return the optimizer with proper parameter handling."""
@@ -593,9 +504,10 @@ class NLPSeq2SeqTrainer(Seq2SeqTrainer, TrainerCustomizationMixin):
                     logger.info(f"PEFT config: {peft_config}")
                     
                     # Add PEFT-specific memory optimizations
-                    if getattr(self.args, "gradient_checkpointing", False):
-                        logger.info("Enabling gradient checkpointing for PEFT model")
-                        self.model.gradient_checkpointing_enable()
+                    optimize_memory_settings(
+                        model=self.model,
+                        use_gradient_checkpointing=getattr(self.args, "gradient_checkpointing", False)
+                    )
                         
             except Exception as e:
                 logger.warning(f"Error configuring PEFT model: {e}")
