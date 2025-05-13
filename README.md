@@ -1,4 +1,4 @@
-# Explore LLM
+# Finetune Levelling
 
 A flexible framework for exploring, fine-tuning, and deploying language models with a focus on efficiency and performance.
 
@@ -25,8 +25,8 @@ A flexible framework for exploring, fine-tuning, and deploying language models w
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/explore_llm.git
-cd explore_llm
+git clone https://github.com/yourusername/finetune_leveling.git
+cd finetune_leveling
 pip install -r requirements.txt
 ```
 
@@ -145,7 +145,7 @@ For more detailed documentation, see:
 ## Project Structure
 
 ```
-explore_llm/
+finetune_leveling/
 ├── NLP/
 │   ├── classes/
 │   │   ├── accelerated_trainers.py

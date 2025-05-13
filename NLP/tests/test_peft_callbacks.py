@@ -2,12 +2,10 @@ import unittest
 import os
 import shutil
 import tempfile
-import torch
 from unittest.mock import MagicMock, patch
-import pytorch_lightning as pl
 
 # Import the PEFT callbacks
-from explore_llm.NLP.classes.peft_callbacks import (
+from finetune_leveling.NLP.classes.peft_callbacks import (
     PeftAdapterMonitorCallback,
     PeftEarlyPruningCallback,
     PeftAdapterFusionCallback

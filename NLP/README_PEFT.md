@@ -1,6 +1,6 @@
-# Parameter-Efficient Fine-Tuning (PEFT) in explore_llm
+# Parameter-Efficient Fine-Tuning (PEFT) in finetune_leveling
 
-This document explains how to use the Parameter-Efficient Fine-Tuning (PEFT) features implemented in the `explore_llm` library.
+This document explains how to use the Parameter-Efficient Fine-Tuning (PEFT) features implemented in the `finetune_leveling` library.
 
 ## Overview
 

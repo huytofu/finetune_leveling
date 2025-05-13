@@ -6,7 +6,7 @@ import transformers
 from collections import Counter
 
 # Import the TypeUtils class
-from explore_llm.NLP.classes.type_utils import TypeUtils
+from finetune_leveling.NLP.classes.type_utils import TypeUtils
 
 
 class MockParameter:

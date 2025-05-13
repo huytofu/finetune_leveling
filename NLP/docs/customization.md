@@ -1,6 +1,6 @@
 # Customization Guide
 
-This guide details all customization options available in the explore_llm library.
+This guide details all customization options available in the finetune_leveling library.
 
 ## Training Framework Selection
 

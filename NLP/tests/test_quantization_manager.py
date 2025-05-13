@@ -1,10 +1,9 @@
 import unittest
 import torch
 from unittest.mock import MagicMock, patch
-import transformers
 
 # Import the QuantizationManager class
-from explore_llm.NLP.classes.quantization_manager import QuantizationManager
+from finetune_leveling.NLP.classes.quantization_manager import QuantizationManager
 
 
 class TestQuantizationManager(unittest.TestCase):

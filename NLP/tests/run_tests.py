@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Script to run all tests for the PEFT implementation in explore_llm.
+Script to run all tests for the PEFT implementation in finetune_leveling.
 This script discovers and runs all tests in the tests directory.
 """
 

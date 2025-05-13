@@ -88,7 +88,7 @@ RECOMMENDED_STUDENT_MODELS = {
 
 ### Basic Configuration
 ```python
-from explore_llm.NLP.modules.pipelines import FineTuneConfig
+from finetune_leveling.NLP.modules.pipelines import FineTuneConfig
 
 config = FineTuneConfig(
     model_name="distilbert-base-uncased",  # Student model
@@ -128,7 +128,7 @@ config = FineTuneConfig(
 
 ### Basic Text Classification
 ```python
-from explore_llm.NLP.modules.pipelines import FineTunePipeline
+from finetune_leveling.NLP.modules.pipelines import FineTunePipeline
 
 # Configure distillation
 config = FineTuneConfig(
@@ -252,7 +252,7 @@ MODEL_SIZE_RATIOS = {
 
 ### Example Monitoring Setup
 ```python
-from explore_llm.NLP.modules.monitoring import DistillationMonitor
+from finetune_leveling.NLP.modules.monitoring import DistillationMonitor
 
 monitor = DistillationMonitor(
     teacher_model=teacher,
